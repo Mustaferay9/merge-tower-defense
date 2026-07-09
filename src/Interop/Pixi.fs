@@ -33,6 +33,7 @@ type Graphics =
     abstract drawRect: x: float * y: float * width: float * height: float -> Graphics
     abstract drawRoundedRect: x: float * y: float * width: float * height: float * radius: float -> Graphics
     abstract drawCircle: x: float * y: float * radius: float -> Graphics
+    abstract drawEllipse: x: float * y: float * width: float * height: float -> Graphics
     /// Flat [x1; y1; x2; y2; ...] vertex list. Typed as obj[] on purpose:
     /// Fable compiles float[] to a Float64Array, which Pixi's polygon
     /// parsing silently rejects — obj[] stays a plain JS array.

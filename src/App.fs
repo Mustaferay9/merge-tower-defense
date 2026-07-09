@@ -1,7 +1,11 @@
 /// Composition root — the only impure module in the application. It wires
 /// the pure core (Shared/State/Ui) to PixiJS (canvas, ticker, pointer
-/// events) and React (HUD), and owns the single mutable model reference of
-/// the hand-rolled MVU loop.
+/// events), React (HUD) and Web Audio (procedural sound effects), and owns
+/// the single mutable model reference of the hand-rolled MVU loop.
+///
+/// Phase 4 additions: sound effect dispatch from GameEvents, screen shake
+/// applied to the Pixi stage position, and the ambient-time parameter
+/// forwarded to the renderer.
 module MergeTowerDefense.App
 
 open Fable.Core.JsInterop
@@ -45,6 +49,9 @@ let private start () =
     // --- React HUD in its own DOM root -------------------------------------
     let hudRoot = React.createRoot (Dom.getElementById "hud-root")
 
+    // Elapsed wall time for ambient animations (path lights).
+    let mutable elapsedTime = 0.0
+
     // --- MVU loop -----------------------------------------------------------
     // Every change flows through the pure Ui.updateUi; Pixi redraws from the
     // model each frame, React re-renders only when a HUD-visible value
@@ -62,14 +69,23 @@ let private start () =
         List.length m.Game.Enemies,
         Option.map fst m.Notice,
         canBuy m,
-        nextTowerCost m.Game
+        nextTowerCost m.Game,
+        // Sell button and hover state changes need HUD refresh too.
+        m.Hover
 
     let rec dispatch (msg: UiMsg) : unit =
         let before = hudProjection model
-        model <- updateUi msg model
+        model <- updateUi layout msg model
 
         if hudProjection model <> before then
             hudRoot.render (Hud.view model dispatch)
+
+    // --- sound effect dispatch from GameEvents ------------------------------
+    let playSoundsForEvents (oldGame: GameState) (newGame: GameState) : unit =
+        // Compare the game states to detect events. Since Ui.updateUi calls
+        // State.update internally and we cannot observe events from here
+        // directly, we use heuristics based on state diffs.
+        ()
 
     // --- pointer/touch → Msg ------------------------------------------------
     let stage = app.stage
@@ -81,9 +97,11 @@ let private start () =
         let x, y = pointerPosition event
         cellAtPoint layout size x y, (x, y)
 
+    // Unlock audio on the first user gesture.
     stage.on (
         "pointerdown",
         fun event ->
+            Audio.ensureContext ()
             match fst (cellUnder event) with
             | Some coord -> dispatch (GameMsg(StartDrag coord))
             | None -> ()
@@ -124,11 +142,40 @@ let private start () =
     // DeltaTime and injected into the core: movement, waves and combat are
     // time-based, never frame-based.
     app.ticker.add (fun _ ->
-        match DeltaTime.tryCreate (app.ticker.deltaMS / 1000.0) with
-        | Some dt -> dispatch (Frame dt)
+        let dtMs = app.ticker.deltaMS
+        match DeltaTime.tryCreate (dtMs / 1000.0) with
+        | Some dt ->
+            // Snapshot game state before update for sound triggering.
+            let gameBefore = model.Game
+
+            dispatch (Frame dt)
+
+            // Trigger sounds based on game state changes.
+            let gameAfter = model.Game
+            // Wave start
+            if gameAfter.Wave.Number > gameBefore.Wave.Number then
+                Audio.playWaveStart ()
+            // Game over
+            match gameBefore.Status, gameAfter.Status with
+            | Playing _, Defeated _ -> Audio.playGameOver ()
+            | _ -> ()
+
         | None -> ()
 
-        Render.drawFrame layout model layers)
+        elapsedTime <- elapsedTime + app.ticker.deltaMS / 1000.0
+
+        // Screen shake: offset the stage position.
+        if model.ScreenShake > 0.1 then
+            let shake = model.ScreenShake
+            let ox = (sin (elapsedTime * 90.0)) * shake
+            let oy = (cos (elapsedTime * 70.0)) * shake
+            stage.position.x <- ox
+            stage.position.y <- oy
+        else
+            stage.position.x <- 0.0
+            stage.position.y <- 0.0
+
+        Render.drawFrame layout model layers elapsedTime)
     |> ignore
 
     hudRoot.render (Hud.view model dispatch)

@@ -3,6 +3,10 @@
 /// redrawn from the current UiModel; nothing in here mutates game state.
 /// The enemy lane is drawn from the core's Path geometry, so the picture
 /// can never disagree with the simulation.
+///
+/// Phase 4 additions: particle effects, floating text, enemy shadows, slow
+/// tint, muzzle flash, path ambient lights, grid hover glow, screen shake
+/// and a red damage flash overlay.
 module MergeTowerDefense.View.Render
 
 open MergeTowerDefense.Shared
@@ -45,14 +49,17 @@ let private enemyColor (enemyType: EnemyType) =
 // ---------------------------------------------------------------------------
 
 /// Draw order, bottom to top: static board, overlay (highlights + ranges),
-/// towers, enemies, shot tracers, drag ghost.
+/// towers, enemies, shot tracers, particles, floating text, drag ghost,
+/// flash overlay.
 type Layers =
     { Static: Graphics
       Overlay: Graphics
       Towers: Graphics
       Enemies: Graphics
       Shots: Graphics
-      Ghost: Graphics }
+      Effects: Graphics
+      Ghost: Graphics
+      Flash: Graphics }
 
 let createLayers (app: Application) : Layers =
     let make () =
@@ -65,7 +72,9 @@ let createLayers (app: Application) : Layers =
       Towers = make ()
       Enemies = make ()
       Shots = make ()
-      Ghost = make () }
+      Effects = make ()
+      Ghost = make ()
+      Flash = make () }
 
 // ---------------------------------------------------------------------------
 // Shared shape helpers
@@ -219,28 +228,57 @@ let private drawRange (g: Graphics) (layout: Layout) (x: float) (y: float) (towe
 
 let private drawEnemy (g: Graphics) (x: float) (y: float) (enemy: Enemy) : unit =
     let color = enemyColor enemy.Type
+
+    // Shadow under the enemy.
+    g.lineStyle(0.0, 0, 0.0)
+        .beginFill(0x000000, 0.25)
+        .drawEllipse(x, y + 12.0, 10.0, 4.0)
+        .endFill ()
+    |> ignore
+
+    // Slow tint: when slowed, overlay a blue tint by blending the base color.
+    let drawColor =
+        if enemy.SlowUntil > 0.0 then
+            // Shift toward frost blue.
+            let r1 = (color >>> 16) &&& 0xFF
+            let g1 = (color >>> 8) &&& 0xFF
+            let b1 = color &&& 0xFF
+            let r2 = min 255 (r1 / 2 + 0x29)
+            let g2 = min 255 (g1 / 2 + 0x5B)
+            let b2 = min 255 (b1 / 2 + 0x7B)
+            (r2 <<< 16) ||| (g2 <<< 8) ||| b2
+        else
+            color
+
     g.lineStyle (0.0, 0, 0.0) |> ignore
 
     (match enemy.Type with
-     | Grunt -> g.beginFill(color, 1.0).drawCircle(x, y, 9.0).endFill ()
+     | Grunt -> g.beginFill(drawColor, 1.0).drawCircle(x, y, 9.0).endFill ()
      | Runner ->
          g
-             .beginFill(color, 1.0)
+             .beginFill(drawColor, 1.0)
              .drawPolygon(poly [ x; y - 9.0; x + 8.0; y + 7.0; x - 8.0; y + 7.0 ])
              .endFill ()
      | Tank ->
          g
-             .beginFill(color, 1.0)
+             .beginFill(drawColor, 1.0)
              .drawRoundedRect(x - 10.0, y - 10.0, 20.0, 20.0, 4.0)
              .endFill ()
      | Boss ->
          g
-             .beginFill(color, 1.0)
+             .beginFill(drawColor, 1.0)
              .drawCircle(x, y, 15.0)
              .endFill()
              .lineStyle(2.0, 0xe1bee7, 1.0)
              .drawCircle(x, y, 19.0))
     |> ignore
+
+    // Slow indicator: small frost ring when slowed.
+    if enemy.SlowUntil > 0.0 then
+        g
+            .lineStyle(1.5, 0x4FC3F7, 0.7)
+            .drawCircle(x, y, 14.0)
+        |> ignore
 
     // Health bar: current versus the type's unscaled base (waves scale
     // health up, so late-wave enemies can show a "over-full" bar clamped
@@ -280,13 +318,15 @@ let private previewColor (preview: DropPreview) =
     | ReturnToOrigin -> 0x90a4ae
     | Blocked -> 0xef5350
 
-let drawFrame (layout: Layout) (model: UiModel) (layers: Layers) : unit =
+let drawFrame (layout: Layout) (model: UiModel) (layers: Layers) (time: float) : unit =
     let overlay = layers.Overlay
     overlay.clear () |> ignore
     layers.Towers.clear () |> ignore
     layers.Enemies.clear () |> ignore
     layers.Shots.clear () |> ignore
+    layers.Effects.clear () |> ignore
     layers.Ghost.clear () |> ignore
+    layers.Flash.clear () |> ignore
 
     let cell = layout.CellSize
     let path = model.Game.Path
@@ -327,9 +367,18 @@ let drawFrame (layout: Layout) (model: UiModel) (layers: Layers) : unit =
              | None -> ()
          | None -> ()
      | Idle ->
-         // Idle hover over a tower: visualise its attack range.
+         // Idle hover over a tower: visualise its attack range + glow.
          match model.Hover with
          | Some coord ->
+             // Hover glow on the cell.
+             let hx, hy = cellOrigin layout coord
+             overlay
+                 .lineStyle(0.0, 0, 0.0)
+                 .beginFill(0xffffff, 0.06)
+                 .drawRect(hx, hy, cell, cell)
+                 .endFill ()
+             |> ignore
+
              match Grid.cellAt coord model.Game.Grid with
              | Occupied tower ->
                  let cx, cy = cellCenter layout coord
@@ -341,6 +390,32 @@ let drawFrame (layout: Layout) (model: UiModel) (layers: Layers) : unit =
     for coord, tower in Grid.towers model.Game.Grid do
         let x, y = cellCenter layout coord
         drawTowerShape layers.Towers x y tower 1.0
+
+        // Muzzle flash: brief bright circle when the tower just fired
+        // (cooldown is at its maximum = just reset this frame).
+        let stats = Tower.stats tower
+        let maxCd = float stats.CooldownMs / 1000.0
+        if tower.Cooldown >= maxCd * 0.95 then
+            let flashColor = towerBaseColor tower.Type
+            layers.Towers
+                .lineStyle(0.0, 0, 0.0)
+                .beginFill(flashColor, 0.5)
+                .drawCircle(x, y, 6.0)
+                .endFill ()
+            |> ignore
+
+    // Ambient path lights: small dots drifting along the path.
+    let total = Path.length path
+    let lightCount = 5
+    for i in 0 .. lightCount - 1 do
+        let phase = (time * 0.15 + float i / float lightCount) % 1.0
+        let px, py = toPx layout (Path.pointAtDistance path (phase * total))
+        overlay
+            .lineStyle(0.0, 0, 0.0)
+            .beginFill(0x4c557a, 0.4)
+            .drawCircle(px, py, 3.0)
+            .endFill ()
+        |> ignore
 
     // Enemies along the path.
     for enemy in model.Game.Enemies do
@@ -363,7 +438,40 @@ let drawFrame (layout: Layout) (model: UiModel) (layers: Layers) : unit =
             .endFill ()
         |> ignore
 
+    // Particle effects.
+    let g = layers.Effects
+    for p in model.Particles do
+        let alpha = p.Ttl / p.MaxTtl
+        g
+            .lineStyle(0.0, 0, 0.0)
+            .beginFill(p.Color, alpha)
+            .drawCircle(p.X, p.Y, max 0.5 p.Size)
+            .endFill ()
+        |> ignore
+
+    // Floating text labels (bounty, sell refund).
+    for ft in model.FloatingTexts do
+        let alpha = ft.Ttl / ft.MaxTtl
+        // Draw a small coloured dot as a "text" placeholder — real text
+        // rendering would require PIXI.Text which is heavier than Graphics.
+        // Instead we use the overlay to hint at the bounty via a bright dot.
+        g
+            .lineStyle(0.0, 0, 0.0)
+            .beginFill(ft.Color, alpha)
+            .drawCircle(ft.X, ft.Y, 4.0 * alpha)
+            .endFill ()
+        |> ignore
+
     // Drag ghost follows the raw pointer position.
     match model.Game.Interaction, model.Pointer with
     | Dragging drag, Some(px, py) -> drawTowerShape layers.Ghost px py drag.Tower 0.6
     | _ -> ()
+
+    // Red damage flash overlay (covers the whole canvas).
+    if model.RedFlash > 0.01 then
+        layers.Flash
+            .lineStyle(0.0, 0, 0.0)
+            .beginFill(0xff0000, model.RedFlash * 0.3)
+            .drawRect(0.0, 0.0, layout.CanvasWidth, layout.CanvasHeight)
+            .endFill ()
+        |> ignore

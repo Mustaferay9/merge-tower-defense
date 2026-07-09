@@ -442,7 +442,10 @@ type Enemy =
     { Id: EnemyId
       Type: EnemyType
       Health: Health
-      Progress: PathProgress }
+      Progress: PathProgress
+      /// Remaining seconds of Frost slow effect. When positive the enemy
+      /// moves at half speed. Decremented each tick by State.stepMovement.
+      SlowUntil: float }
 
 module Enemy =
     /// Spawns at the path start; health = type base × multiplier, kept ≥ 1
@@ -456,21 +459,29 @@ module Enemy =
         { Id = id
           Type = enemyType
           Health = Health hp
-          Progress = PathProgress.start },
+          Progress = PathProgress.start
+          SlowUntil = 0.0 },
         gen'
 
     let spawn (gen: EnemyIdGen) (enemyType: EnemyType) : Enemy * EnemyIdGen = spawnWith gen enemyType 1.0
 
     /// Time-based movement along the path (speed is cells per second, so
     /// the progress delta is normalised by the path length).
+    /// When SlowUntil > 0 the enemy moves at half speed (Frost effect).
     let advance (path: Path) (dt: DeltaTime) (enemy: Enemy) : MoveResult =
         let (PathProgress p) = enemy.Progress
+        let slowFactor = if enemy.SlowUntil > 0.0 then 0.5 else 1.0
 
         let p' =
             p
-            + EnemyType.speed enemy.Type * DeltaTime.seconds dt / Path.length path
+            + EnemyType.speed enemy.Type * slowFactor * DeltaTime.seconds dt / Path.length path
 
         if p' >= 1.0 then ReachedGoal else Moved(PathProgress p')
+
+    /// Decrement the slow timer by the elapsed seconds.
+    let tickSlow (dtSeconds: float) (enemy: Enemy) : Enemy =
+        if enemy.SlowUntil <= 0.0 then enemy
+        else { enemy with SlowUntil = max 0.0 (enemy.SlowUntil - dtSeconds) }
 
     /// Current position in cell units.
     let positionOn (path: Path) (enemy: Enemy) : float * float = Path.positionAt path enemy.Progress

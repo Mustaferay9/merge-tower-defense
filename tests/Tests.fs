@@ -723,10 +723,12 @@ let private uiLayoutTests () =
          Enemy.positionOn path5 e = List.head (Path.waypoints path5))
 
 let private uiHudTests () =
+    let path5 = Path.defaultFor size5
+    let layout = layoutFor size5 path5
     let model = init size5
 
     // Buying through the HUD: first empty cell, gold drawn from the core.
-    let m1 = updateUi (Buy Archer) model
+    let m1 = updateUi layout (Buy Archer) model
     check "HUD buy places a tower on the first empty cell"
         (match Grid.cellAt (at 0 0) m1.Game.Grid with
          | Occupied t -> t.Type = Archer && t.Level = Level1
@@ -734,17 +736,17 @@ let private uiHudTests () =
     check "HUD buy deducts gold" (goldOf m1.Game = startingGold - towerBaseCost)
 
     check "cannot buy while dragging"
-        (let dragging = updateUi (GameMsg(StartDrag(at 0 0))) m1
+        (let dragging = updateUi layout (GameMsg(StartDrag(at 0 0))) m1
          canBuy dragging = false)
 
     check "cannot buy when broke"
         (let broke =
-            [ 1 .. 4 ] |> List.fold (fun m _ -> updateUi (Buy Archer) m) model
+            [ 1 .. 4 ] |> List.fold (fun m _ -> updateUi layout (Buy Archer) m) model
          canBuy broke = false)
 
     // Frame: injected time drives the core scheduler.
     let after6s =
-        [ 1 .. 60 ] |> List.fold (fun m _ -> updateUi (Frame(dt 0.1)) m) model
+        [ 1 .. 60 ] |> List.fold (fun m _ -> updateUi layout (Frame(dt 0.1)) m) model
 
     check "frames drive the wave scheduler" (after6s.Game.Wave.Number = 1)
     check "wave start raises a HUD notice" (after6s.Notice |> Option.isSome)
@@ -753,9 +755,9 @@ let private uiHudTests () =
     let combatModel =
         { model with Game = fst (run [ SpawnTower(Archer, at 0 0); SpawnEnemy Grunt ] (noWaves model.Game)) }
 
-    let firing = updateUi (Frame(dt 0.05)) combatModel
+    let firing = updateUi layout (Frame(dt 0.05)) combatModel
     check "tower fire leaves a shot tracer" (not (List.isEmpty firing.Shots))
-    let faded = updateUi (Frame(dt 0.5)) firing
+    let faded = updateUi layout (Frame(dt 0.5)) firing
     check "shot tracers fade out" (List.isEmpty faded.Shots)
 
     // Notices: set by noteworthy events, silent otherwise, and they expire.
@@ -764,23 +766,123 @@ let private uiHudTests () =
           GameMsg(SpawnTower(Cannon, at 3 1))
           GameMsg(StartDrag(at 3 0))
           GameMsg(Drop(at 3 1)) ]
-        |> List.fold (fun m msg -> updateUi msg m) { model with Game = noWaves model.Game }
+        |> List.fold (fun m msg -> updateUi layout msg m) { model with Game = noWaves model.Game }
 
     check "incompatible merge raises a HUD notice" (mismatch.Notice |> Option.isSome)
     check "notice expires after its time-to-live"
         (let faded =
-            [ 1 .. 4 ] |> List.fold (fun m _ -> updateUi (Frame(dt 1.0)) m) mismatch
+            [ 1 .. 4 ] |> List.fold (fun m _ -> updateUi layout (Frame(dt 1.0)) m) mismatch
          faded.Notice = None)
 
     check "plain pointer movement raises no notice"
-        ((updateUi (PointerMoved(Some(at 1 1), Some(10.0, 10.0))) model).Notice = None)
+        ((updateUi layout (PointerMoved(Some(at 1 1), Some(10.0, 10.0))) model).Notice = None)
 
     // Restart resets the whole game.
-    let restarted = updateUi Restart after6s
+    let restarted = updateUi layout Restart after6s
     check "restart returns to a fresh game"
         (restarted.Game.Wave.Number = 0
          && Grid.towerCount restarted.Game.Grid = 0
          && goldOf restarted.Game = startingGold)
+
+// ---------------------------------------------------------------------------
+// Frost slow tests (Phase 4)
+// ---------------------------------------------------------------------------
+
+let private testFrostSlow () =
+    // Place a frost tower and an enemy, then tick. The frost tower should
+    // slow the enemy after hitting it.
+    let initial = fresh () |> noWaves
+    let state, _ = run [ SpawnTower(Frost, at 0 0); SpawnEnemy Grunt ] initial
+
+    // Tick until the frost tower fires (its cooldown is 0 at spawn).
+    let state1, events1 = ticks 1 0.05 state
+
+    // The frost tower should have fired and the enemy should be slowed.
+    let hasFired = events1 |> List.exists (fun e ->
+        match e with | TowerFired _ -> true | _ -> false)
+    check "frost tower fires at enemy" hasFired
+
+    let hasSlowed = events1 |> List.exists (fun e ->
+        match e with | EnemySlowed _ -> true | _ -> false)
+    check "frost hit produces EnemySlowed event" hasSlowed
+
+    // The enemy's SlowUntil should be positive.
+    let slowedEnemy = state1.Enemies |> List.tryHead
+    check "enemy has SlowUntil > 0 after frost hit"
+        (match slowedEnemy with
+         | Some e -> e.SlowUntil > 0.0
+         | None -> false)
+
+    // Movement under slow is reduced: advance the enemy for 1s while slowed
+    // and compare with an unslowed enemy.
+    let unslowedEnemy, _ = Enemy.spawn EnemyIdGen.initial Grunt
+    let pathForTest = Path.defaultFor size5
+    let dtOne = dt 1.0
+    let slowedResult = Enemy.advance pathForTest dtOne { unslowedEnemy with SlowUntil = 1.0 }
+    let normalResult = Enemy.advance pathForTest dtOne unslowedEnemy
+
+    check "slowed enemy moves less than normal"
+        (match slowedResult, normalResult with
+         | Moved sp, Moved np -> PathProgress.value sp < PathProgress.value np
+         | _ -> false)
+
+    // Slow decays after its duration.
+    let tickedSlow = Enemy.tickSlow 2.0 { unslowedEnemy with SlowUntil = 1.5 }
+    check "slow timer decays to zero" (tickedSlow.SlowUntil = 0.0)
+
+// ---------------------------------------------------------------------------
+// Tower sell tests (Phase 4)
+// ---------------------------------------------------------------------------
+
+let private testSellTower () =
+    let initial = fresh () |> noWaves
+    let state, _ = run [ SpawnTower(Archer, at 0 0) ] initial
+
+    // Sell the tower.
+    let state1, events1 = update (SellTower(at 0 0)) state
+    check "sold tower is removed from grid"
+        (Grid.cellAt (at 0 0) state1.Grid = Empty)
+    check "sell earns a refund"
+        (goldOf state1 > goldOf state)
+    check "sell emits TowerSold event"
+        (events1 |> List.exists (fun e ->
+            match e with | TowerSold _ -> true | _ -> false))
+
+    // Sell on empty cell is rejected.
+    let _, events2 = update (SellTower(at 1 1)) state
+    check "sell empty cell is rejected"
+        (hasReject (OriginEmpty(at 1 1)) events2)
+
+    // Sell while dragging is rejected.
+    let dragging, _ = update (StartDrag(at 0 0)) state
+    let _, events3 = update (SellTower(at 0 0)) dragging
+    check "sell while dragging is rejected"
+        (hasReject SpawnWhileDragging events3)
+
+    // Sell value scales with level: level 1 gives 60% of 20 = 12.
+    let sellRefund = sellValue { Id = fst (TowerIdGen.next TowerIdGen.initial); Type = Archer; Level = Level1; Cooldown = 0.0 }
+    check "sell value for L1 tower is 12" (sellRefund = 12)
+
+// ---------------------------------------------------------------------------
+// Particle generation tests (Phase 4)
+// ---------------------------------------------------------------------------
+
+let private testParticles () =
+    let path5 = Path.defaultFor size5
+    let layout = layoutFor size5 path5
+    let model = init size5
+
+    // Merge two archers and check that particles are generated.
+    let withTowers =
+        [ GameMsg(SpawnTower(Archer, at 0 0))
+          GameMsg(SpawnTower(Archer, at 0 1)) ]
+        |> List.fold (fun m msg -> updateUi layout msg m) { model with Game = noWaves model.Game }
+
+    let merged =
+        [ GameMsg(StartDrag(at 0 0)); GameMsg(Drop(at 0 1)) ]
+        |> List.fold (fun m msg -> updateUi layout msg m) withTowers
+
+    check "merge produces sparkle particles" (not (List.isEmpty merged.Particles))
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -804,6 +906,9 @@ let main _argv =
     testStats ()
     uiLayoutTests ()
     uiHudTests ()
+    testFrostSlow ()
+    testSellTower ()
+    testParticles ()
 
     printfn ""
     printfn "%d passed, %d failed" passed failed

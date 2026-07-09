@@ -105,6 +105,11 @@ let towerCostGrowth = 4
 let nextTowerCost (state: GameState) =
     towerBaseCost + towerCostGrowth * state.TowersBought
 
+/// Refund value when selling a tower (60 % of base cost for its level).
+let sellValue (tower: Tower) =
+    let rank = TowerLevel.rank tower.Level
+    int (round (float towerBaseCost * float (pown 2 (rank - 1)) * 0.6))
+
 module GameState =
     let create (size: GridSize) =
         { Grid = Grid.create size
@@ -145,6 +150,7 @@ type GameEvent =
     | TowerReturned of tower: Tower * origin: Coord
     | TowerSpawned of tower: Tower * at: Coord
     | TowerBought of tower: Tower * at: Coord * cost: int
+    | TowerSold of tower: Tower * at: Coord * refund: int
     /// A shot was fired from a tower cell at a target position (cell units).
     | TowerFired of TowerId * Coord * (float * float)
     | WaveStarted of wave: int
@@ -154,6 +160,7 @@ type GameEvent =
     | LifeLost of remaining: int
     | EnemyDamaged of EnemyId * remaining: Health
     | EnemyKilled of EnemyId * bounty: int
+    | EnemySlowed of EnemyId
     | GameOver of wavesSurvived: int
     | ActionRejected of RejectReason
 
@@ -165,6 +172,7 @@ type Msg =
     | Drop of Coord
     | CancelDrag
     | BuyTower of TowerType * Coord
+    | SellTower of Coord
     | Tick of DeltaTime
     | SpawnTower of TowerType * Coord
     | SpawnEnemy of EnemyType
@@ -260,8 +268,11 @@ let private stepWave (dtSeconds: float) (state: GameState) =
     | Spawning(pending, untilNext) -> drainSpawns (withPhase (Spawning(pending, untilNext - dtSeconds)) state) []
 
 /// Moves every enemy; goal-reachers cost lives and may end the game.
+/// Also decrements Frost slow timers.
 let private stepMovement (dt: DeltaTime) (state: GameState) =
+    let dtSeconds = DeltaTime.seconds dt
     let folder (survivors, status, events) (enemy: Enemy) =
+        let enemy = Enemy.tickSlow dtSeconds enemy
         match Enemy.advance state.Path dt enemy with
         | Moved progress -> { enemy with Progress = progress } :: survivors, status, events
         | ReachedGoal ->
@@ -319,11 +330,19 @@ let private stepCombat (dtSeconds: float) (state: GameState) =
 
                     match AttackResult.ofDamage (Tower.attackDamage tower) target.Health with
                     | Survived remaining ->
+                        let slowEvents =
+                            if tower.Type = Frost && target.SlowUntil <= 0.0 then [ EnemySlowed target.Id ] else []
+                        let slowDuration = if tower.Type = Frost then 1.5 else 0.0
                         enemies
-                        |> List.map (fun e -> if e.Id = target.Id then { e with Health = remaining } else e),
+                        |> List.map (fun e ->
+                            if e.Id = target.Id then
+                                { e with
+                                    Health = remaining
+                                    SlowUntil = max e.SlowUntil slowDuration }
+                            else e),
                         gold,
                         resets,
-                        events @ [ fired; EnemyDamaged(target.Id, remaining) ]
+                        events @ [ fired; EnemyDamaged(target.Id, remaining) ] @ slowEvents
                     | Killed ->
                         let bounty = EnemyType.bounty target.Type
 
@@ -472,6 +491,18 @@ let private updatePlaying (msg: Msg) (state: GameState) : GameState * GameEvent 
                     TowerIds = towerIds
                     TowersBought = state.TowersBought + 1 },
                 [ TowerBought(tower, coord, cost) ]
+
+    // -- economy: selling towers ----------------------------------------------
+
+    | SellTower _, Dragging _ -> state, [ ActionRejected SpawnWhileDragging ]
+
+    | SellTower coord, Idle ->
+        match Grid.tryLift coord state.Grid with
+        | None -> state, [ ActionRejected(OriginEmpty coord) ]
+        | Some(tower, grid) ->
+            let refund = sellValue tower
+            { state with Grid = grid; Gold = Gold.earn refund state.Gold },
+            [ TowerSold(tower, coord, refund) ]
 
     // -- test/tooling messages ------------------------------------------------
 
