@@ -19,24 +19,31 @@ open MergeTowerDefense.View
 let private gridSide = 5
 
 let private start () =
-    let size =
-        match GridSize.tryCreate gridSide with
-        | Some s -> s
-        // Unreachable: gridSide is a compile-time constant within
-        // GridSize.minSize..maxSize.
-        | None -> failwith "unreachable: gridSide is a valid grid size"
+    let campaign =
+        match Dom.getItem "mtd_campaign" with
+        | Some json ->
+            try Fable.Core.JS.JSON.parse(json) |> unbox<CampaignState>
+            with _ -> CampaignState.empty
+        | None -> CampaignState.empty
 
-    // The path is part of the pure game state; layout is derived from it so
-    // the canvas always contains the whole course. Restart keeps the same
-    // deterministic path, so the layout stays valid for the app's lifetime.
-    let mutable model = init size
-    let layout = layoutFor size model.Game.Path
+    let maxWave =
+        match Dom.getItem "mtd_maxWave" with
+        | Some s -> try int s with _ -> 0
+        | None -> 0
+
+    let currentLevel = Levels.get 1 |> Option.get
+    let mutable model = init campaign currentLevel maxWave
+    
+    let getLayout (m: UiModel) =
+        let level = Levels.get m.Game.LevelId |> Option.get
+        layoutFor level.Size m.Game.Path
 
     // --- PixiJS application (WebGL with automatic canvas fallback) --------
+    let initialLayout = getLayout model
     let app =
         createApplication
-            [ "width", box layout.CanvasWidth
-              "height", box layout.CanvasHeight
+            [ "width", box initialLayout.CanvasWidth
+              "height", box initialLayout.CanvasHeight
               "background", box 0x141724
               "antialias", box true ]
 
@@ -44,7 +51,9 @@ let private start () =
     Dom.appendChild (Dom.getElementById "game-root") app.view
 
     let layers = Render.createLayers app
-    Render.drawStatic layout size model.Game.Path layers
+    let mutable currentRenderedTheme = model.Game.Theme
+    let mutable currentRenderedSize = currentLevel.Size
+    Render.drawStatic currentRenderedTheme initialLayout currentRenderedSize model.Game.Path layers
 
     // --- React HUD in its own DOM root -------------------------------------
     let hudRoot = React.createRoot (Dom.getElementById "hud-root")
@@ -64,6 +73,8 @@ let private start () =
          | Spawning _ -> -1
          | WaveActive -> -2),
         (match m.Game.Status with
+         | CampaignMenu | TalentScreen -> -3
+         | Victory -> -4
          | Playing lives -> Lives.value lives
          | Defeated _ -> -1),
         List.length m.Game.Enemies,
@@ -75,36 +86,101 @@ let private start () =
 
     let rec dispatch (msg: UiMsg) : unit =
         let before = hudProjection model
+        let beforeMaxWave = model.MaxWaveReached
+        let beforeCampaign = model.Campaign
+        let beforeStatus = model.Game.Status
+
+        let layout = getLayout model
         model <- updateUi layout msg model
+
+        if beforeMaxWave <> model.MaxWaveReached || beforeCampaign <> model.Campaign then
+            Dom.setItem "mtd_maxWave" (string model.MaxWaveReached)
+            Dom.setItem "mtd_campaign" (Fable.Core.JS.JSON.stringify model.Campaign)
+
+        if beforeStatus <> model.Game.Status then
+            match beforeStatus, model.Game.Status with
+            | CampaignMenu, Playing _ -> Audio.startAmbientMusic (sprintf "%A" model.Game.Theme)
+            | Playing _, Defeated _ -> Audio.playGameOver ()
+            | Defeated _, CampaignMenu | Victory, CampaignMenu -> Audio.stopAmbientMusic ()
+            | _ -> ()
 
         if hudProjection model <> before then
             hudRoot.render (Hud.view model dispatch)
 
     // --- sound effect dispatch from GameEvents ------------------------------
     let playSoundsForEvents (oldGame: GameState) (newGame: GameState) : unit =
-        // Compare the game states to detect events. Since Ui.updateUi calls
-        // State.update internally and we cannot observe events from here
-        // directly, we use heuristics based on state diffs.
-        ()
+
+        // 2. Wave Start
+        match oldGame.Wave.Phase, newGame.Wave.Phase with
+        | BetweenWaves _, WaveActive -> Audio.playWaveStart ()
+        | _ -> ()
+
+        // 3. Buying / Merging / Selling
+        let oldTowers = Grid.towerCount oldGame.Grid
+        let newTowers = Grid.towerCount newGame.Grid
+        if newGame.TowersBought > oldGame.TowersBought then
+            Audio.playBuy ()
+        elif newTowers < oldTowers then
+            if Gold.value newGame.Gold > Gold.value oldGame.Gold then
+                Audio.playSell ()
+            else
+                Audio.playMerge ()
+
+        // 4. Enemy Kill
+        let oldEnemies = List.length oldGame.Enemies
+        let newEnemies = List.length newGame.Enemies
+        if newEnemies < oldEnemies then
+            let oldLives = match oldGame.Status with Playing l -> Lives.value l | _ -> 0
+            let newLives = match newGame.Status with Playing l -> Lives.value l | _ -> 0
+            if newLives = oldLives then
+                Audio.playKill ()
+
+        // 5. Shooting
+        Grid.towers newGame.Grid
+        |> List.iter (fun (coord, tower) ->
+            match Grid.tryFindTower coord oldGame.Grid with
+            | Some oldTower when tower.Cooldown > oldTower.Cooldown ->
+                match tower.Type with
+                | Archer -> Audio.playShootArcher ()
+                | Cannon -> Audio.playShootCannon ()
+                | Frost  -> Audio.playShootFrost ()
+            | _ -> ()
+        )
+
+        // 6. Spells
+        match oldGame.Interaction, newGame.Interaction with
+        | CastingSpell spell, Idle when Gold.value newGame.Gold < Gold.value oldGame.Gold ->
+            match spell with
+            | Fireball -> Audio.playSpellFireball ()
+            | FrostNova -> Audio.playSpellFrostNova ()
+        | _ -> ()
 
     // --- pointer/touch → Msg ------------------------------------------------
     let stage = app.stage
     stage.eventMode <- "static"
-    stage.hitArea <- createRectangle 0.0 0.0 layout.CanvasWidth layout.CanvasHeight
+    let initialLayout = getLayout model
+    stage.hitArea <- createRectangle 0.0 0.0 initialLayout.CanvasWidth initialLayout.CanvasHeight
     stage.cursor <- "pointer"
 
     let cellUnder (event: obj) =
         let x, y = pointerPosition event
-        cellAtPoint layout size x y, (x, y)
+        let layout = getLayout model
+        cellAtPoint layout (Grid.size model.Game.Grid) x y, (x, y)
 
     // Unlock audio on the first user gesture.
     stage.on (
         "pointerdown",
         fun event ->
             Audio.ensureContext ()
-            match fst (cellUnder event) with
-            | Some coord -> dispatch (GameMsg(StartDrag coord))
-            | None -> ()
+            match model.Game.Interaction with
+            | CastingSpell spell ->
+                match fst (cellUnder event) with
+                | Some coord -> dispatch (GameMsg(CastSpell(spell, coord)))
+                | None -> dispatch (GameMsg CancelDrag)
+            | Idle | Dragging _ ->
+                match fst (cellUnder event) with
+                | Some coord -> dispatch (GameMsg(StartDrag coord))
+                | None -> ()
     )
     |> ignore
 
@@ -124,6 +200,7 @@ let private start () =
                 match fst (cellUnder event) with
                 | Some coord -> dispatch (GameMsg(Drop coord))
                 | None -> dispatch (GameMsg CancelDrag)
+            | CastingSpell _
             | Idle -> ()
     )
     |> ignore
@@ -133,6 +210,7 @@ let private start () =
         fun _ ->
             match model.Game.Interaction with
             | Dragging _ -> dispatch (GameMsg CancelDrag)
+            | CastingSpell _ -> dispatch (GameMsg CancelDrag) // cancel cast when clicking outside
             | Idle -> ()
     )
     |> ignore
@@ -175,6 +253,13 @@ let private start () =
             stage.position.x <- 0.0
             stage.position.y <- 0.0
 
+        if currentRenderedTheme <> model.Game.Theme then
+            layers.Static.clear() |> ignore
+            currentRenderedTheme <- model.Game.Theme
+            let layout = getLayout model
+            Render.drawStatic currentRenderedTheme layout (Grid.size model.Game.Grid) model.Game.Path layers
+
+        let layout = getLayout model
         Render.drawFrame layout model layers elapsedTime)
     |> ignore
 
@@ -188,6 +273,7 @@ let private start () =
                   "lives",
                   box (
                       match model.Game.Status with
+                      | CampaignMenu | TalentScreen | Victory -> 0
                       | Playing lives -> Lives.value lives
                       | Defeated _ -> 0
                   )
@@ -195,17 +281,22 @@ let private start () =
                   "status",
                   box (
                       match model.Game.Status with
+                      | CampaignMenu -> "mainmenu"
+                      | TalentScreen -> "talents"
                       | Playing _ -> "playing"
                       | Defeated _ -> "defeated"
+                      | Victory -> "victory"
                   )
                   "enemies", box (List.length model.Game.Enemies)
                   "dragging",
                   box (
                       match model.Game.Interaction with
                       | Dragging _ -> true
-                      | Idle -> false
+                      | Idle
+                      | CastingSpell _ -> false
                   )
                   "layout",
+                  let layout = getLayout model
                   createObj
                       [ "gridLeft", box layout.GridLeft
                         "gridTop", box layout.GridTop

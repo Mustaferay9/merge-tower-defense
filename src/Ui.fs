@@ -98,12 +98,25 @@ type FloatingText =
 /// A brief tracer for a shot fired this instant (from a tower cell to a
 /// target position in cell units), fading over Ttl seconds.
 type Shot =
-    { FromCell: Coord
+    { Type: TowerType
+      FromCell: Coord
       Target: float * float
       Ttl: float }
 
+type Shockwave =
+    { X: float
+      Y: float
+      Radius: float
+      MaxRadius: float
+      Color: int
+      Ttl: float
+      MaxTtl: float
+      LineWidth: float }
+
 type UiModel =
-    { Game: GameState
+    { Campaign: CampaignState
+      MaxWaveReached: int
+      Game: GameState
       /// Cell currently under the pointer, if any.
       Hover: Coord option
       /// Raw pointer position in canvas pixels (drives the drag ghost).
@@ -114,6 +127,10 @@ type UiModel =
       Shots: Shot list
       /// Visual particle effects (sparkles, explosions).
       Particles: Particle list
+      /// Persistent weather particle effects (rain, snow).
+      WeatherParticles: Particle list
+      /// Shockwave expanding rings for spells.
+      Shockwaves: Shockwave list
       /// Floating bounty/info text labels.
       FloatingTexts: FloatingText list
       /// Remaining screen shake intensity (decays per frame).
@@ -130,18 +147,30 @@ type UiMsg =
     | Buy of TowerType
     /// HUD "sell tower" on the currently hovered cell.
     | Sell
+    /// HUD start game from main menu.
+    | StartGame
+    | SelectLevel of LevelId
     /// HUD restart after a game over.
     | Restart
     /// One render-loop frame worth of injected time.
+    /// One render-loop frame worth of injected time.
     | Frame of DeltaTime
+    | OpenTalentTree
+    | CloseTalentTree
+    | UpgradeTalent of string
 
-let init (size: GridSize) : UiModel =
-    { Game = GameState.create size
+let init (campaign: CampaignState) (level: LevelDef) (maxWave: int) : UiModel =
+    let game = GameState.create level campaign.Talents
+    { Campaign = campaign
+      MaxWaveReached = maxWave
+      Game = { game with Status = CampaignMenu }
       Hover = None
       Pointer = None
       Notice = None
       Shots = []
       Particles = []
+      WeatherParticles = []
+      Shockwaves = []
       FloatingTexts = []
       ScreenShake = 0.0
       RedFlash = 0.0 }
@@ -158,7 +187,9 @@ let firstEmptyCell (grid: Grid) : Coord option =
 
 let canBuy (model: UiModel) : bool =
     match model.Game.Status with
-    | Defeated _ -> false
+    | CampaignMenu
+    | TalentScreen
+    | Defeated _ | Victory -> false
     | Playing _ ->
         model.Game.Interaction = Idle
         && Gold.value model.Game.Gold >= nextTowerCost model.Game
@@ -218,15 +249,16 @@ let private burstParticles (x: float) (y: float) (count: int) (colors: int list)
 let private mergeColors = [ 0xFFD700; 0xFFFFFF; 0xFFF59D; 0xFFEE58 ]
 let private killColors = [ 0xEF5350; 0xFF7043; 0xFFAB91; 0xFFA726 ]
 let private frostColors = [ 0x4FC3F7; 0x81D4FA; 0xB3E5FC; 0xFFFFFF ]
+let private fireballColors = [ 0xFF4500; 0xFF8C00; 0xFFD700; 0xDC143C ]
 
 /// Convert a cell-unit coordinate to a pixel position for effects.
 let private effectPos (layout: Layout) (coord: Coord) = cellCenter layout coord
 
-let private effectsOf (layout: Layout) (event: GameEvent) (game: GameState) (seed: int) : Particle list * FloatingText list * float * float =
+let private effectsOf (layout: Layout) (event: GameEvent) (game: GameState) (seed: int) : Particle list * Shockwave list * FloatingText list * float * float =
     match event with
     | TowersMerged(_, _, _, at) ->
         let x, y = effectPos layout at
-        burstParticles x y 18 mergeColors 120.0 0.5 seed, [], 3.0, 0.0
+        burstParticles x y 18 mergeColors 120.0 0.5 seed, [], [], 3.0, 0.0
 
     | EnemyKilled(enemyId, bounty) ->
         // Find the killed enemy position from the game state BEFORE the kill
@@ -239,22 +271,28 @@ let private effectsOf (layout: Layout) (event: GameEvent) (game: GameState) (see
                 let px, py = Path.waypoints game.Path |> List.last
                 toPx layout (px, py)
         let particles = burstParticles x y 12 killColors 90.0 0.4 seed
+        let ghostParticle =
+            { X = x; Y = y - 10.0
+              Vx = 0.0; Vy = -30.0 // drifts up
+              Color = 0xE0F7FA // light cyan soul
+              Size = 4.0
+              Ttl = 2.0; MaxTtl = 2.0 }
         let text =
-            [ { X = x; Y = y - 15.0
+            [ { X = x; Y = y - 25.0
                 Text = sprintf "+%dg" bounty
                 Color = 0xFFD700
                 Ttl = 0.9
                 MaxTtl = 0.9 } ]
-        particles, text, 0.0, 0.0
+        ghostParticle :: particles, [], text, 0.0, 0.0
 
     | WaveStarted _ ->
-        [], [], 6.0, 0.0
+        [], [], [], 6.0, 0.0
 
     | LifeLost _ ->
-        [], [], 2.0, 0.6
+        [], [], [], 2.0, 0.6
 
     | GameOver _ ->
-        [], [], 10.0, 0.8
+        [], [], [], 10.0, 0.8
 
     | TowerSold(_, at, refund) ->
         let x, y = effectPos layout at
@@ -264,16 +302,78 @@ let private effectsOf (layout: Layout) (event: GameEvent) (game: GameState) (see
                 Color = 0x66BB6A
                 Ttl = 0.9
                 MaxTtl = 0.9 } ]
-        [], text, 0.0, 0.0
+        [], [], text, 0.0, 0.0
 
     | EnemySlowed enemyId ->
         match game.Enemies |> List.tryFind (fun e -> e.Id = enemyId) with
         | Some enemy ->
             let x, y = toPx layout (Enemy.positionOn game.Path enemy)
-            burstParticles x y 6 frostColors 60.0 0.3 seed, [], 0.0, 0.0
-        | None -> [], [], 0.0, 0.0
+            burstParticles x y 6 frostColors 60.0 0.3 seed, [], [], 0.0, 0.0
+        | None -> [], [], [], 0.0, 0.0
 
-    | _ -> [], [], 0.0, 0.0
+    | EnemyDamaged(enemyId, damage, _) ->
+        match game.Enemies |> List.tryFind (fun e -> e.Id = enemyId) with
+        | Some enemy ->
+            let x, y = toPx layout (Enemy.positionOn game.Path enemy)
+            let jx = x + (float (seed % 20) - 10.0)
+            let jy = y + (float ((seed / 2) % 20) - 10.0)
+            let color = if enemy.SlowUntil > 0.0 then 0x81D4FA else 0xFFFFFF
+            let text =
+                [ { X = jx; Y = jy - 15.0
+                    Text = sprintf "%d" damage
+                    Color = color
+                    Ttl = 0.6
+                    MaxTtl = 0.6 } ]
+            [], [], text, 0.0, 0.0
+        | None -> [], [], [], 0.0, 0.0
+
+    | SpellCast(spell, coord) ->
+        let x, y = effectPos layout coord
+        match spell with
+        | Fireball ->
+            let rSq = float (ActiveSpell.radius spell) * layout.CellSize
+            let sw1 = { X = x; Y = y; Radius = 0.0; MaxRadius = rSq; Color = 0xFFD700; Ttl = 0.3; MaxTtl = 0.3; LineWidth = 12.0 }
+            let sw2 = { X = x; Y = y; Radius = 0.0; MaxRadius = rSq * 1.2; Color = 0xFF4500; Ttl = 0.5; MaxTtl = 0.5; LineWidth = 8.0 }
+            let sw3 = { X = x; Y = y; Radius = 0.0; MaxRadius = rSq * 1.5; Color = 0x8B0000; Ttl = 0.7; MaxTtl = 0.7; LineWidth = 4.0 }
+            burstParticles x y 120 fireballColors 500.0 1.2 seed, [sw1; sw2; sw3], [], 30.0, 1.0
+        | FrostNova ->
+            let rSq = float (ActiveSpell.radius spell) * layout.CellSize
+            let sw1 = { X = x; Y = y; Radius = 0.0; MaxRadius = rSq * 0.8; Color = 0xFFFFFF; Ttl = 0.4; MaxTtl = 0.4; LineWidth = 16.0 }
+            let sw2 = { X = x; Y = y; Radius = 0.0; MaxRadius = rSq; Color = 0x81D4FA; Ttl = 0.7; MaxTtl = 0.7; LineWidth = 8.0 }
+            let sw3 = { X = x; Y = y; Radius = 0.0; MaxRadius = rSq * 1.3; Color = 0x0277BD; Ttl = 1.0; MaxTtl = 1.0; LineWidth = 4.0 }
+            burstParticles x y 100 frostColors 300.0 1.5 seed, [sw1; sw2; sw3], [], 10.0, 0.4
+
+    | _ -> [], [], [], 0.0, 0.0
+
+let private spawnWeather (theme: MapTheme) : Particle list =
+    let rand = System.Random()
+    let count = match theme with River -> 2 | Winter -> 1 | Volcanic -> 1 | Plain -> 0
+    [ for _ in 1 .. count do
+        let x = rand.NextDouble() * 900.0 - 50.0 // spawn slightly off-screen left/right too
+        match theme with
+        | Plain -> failwith "unreachable"
+        | Winter -> // snow
+            { X = x; Y = -20.0
+              Vx = -15.0 + rand.NextDouble() * 30.0
+              Vy = 40.0 + rand.NextDouble() * 20.0
+              Color = 0xFFFFFF
+              Size = 2.0 + rand.NextDouble() * 3.0
+              Ttl = 15.0; MaxTtl = 15.0 }
+        | River -> // rain
+            { X = x; Y = -20.0
+              Vx = 10.0 + rand.NextDouble() * 5.0
+              Vy = 300.0 + rand.NextDouble() * 150.0
+              Color = 0x80D8FF
+              Size = 1.0 + rand.NextDouble() * 1.5
+              Ttl = 3.0; MaxTtl = 3.0 }
+        | Volcanic -> // ash
+            { X = x; Y = 620.0
+              Vx = -10.0 + rand.NextDouble() * 20.0
+              Vy = -40.0 - rand.NextDouble() * 40.0
+              Color = if rand.NextDouble() > 0.8 then 0xFF4500 else 0x444444
+              Size = 2.0 + rand.NextDouble() * 4.0
+              Ttl = 12.0; MaxTtl = 12.0 }
+    ]
 
 // ---------------------------------------------------------------------------
 // UI transition function (pure)
@@ -292,9 +392,10 @@ let private applyGame (layout: Layout) (msg: Msg) (model: UiModel) : UiModel =
         events
         |> List.choose (fun event ->
             match event with
-            | TowerFired(_, origin, target) ->
+            | TowerFired(towerType, _, origin, target) ->
                 Some
-                    { FromCell = origin
+                    { Type = towerType
+                      FromCell = origin
                       Target = target
                       Ttl = shotTtl }
             | _ -> None)
@@ -302,14 +403,16 @@ let private applyGame (layout: Layout) (msg: Msg) (model: UiModel) : UiModel =
     // Generate particles and effects from events.
     let mutable seed = int (System.DateTime.Now.Ticks % 2147483647L)
     let mutable allParticles = model.Particles
+    let mutable allShockwaves = model.Shockwaves
     let mutable allTexts = model.FloatingTexts
     let mutable shake = model.ScreenShake
     let mutable flash = model.RedFlash
 
     for event in events do
-        let p, t, s, f = effectsOf layout event gameBeforeUpdate seed
-        allParticles <- p @ allParticles
-        allTexts <- t @ allTexts
+        let p, sw, t, s, f = effectsOf layout event gameBeforeUpdate seed
+        allParticles <- allParticles @ p
+        allShockwaves <- allShockwaves @ sw
+        allTexts <- allTexts @ t
         shake <- shake + s
         flash <- max flash f
         seed <- seed + 1
@@ -317,15 +420,63 @@ let private applyGame (layout: Layout) (msg: Msg) (model: UiModel) : UiModel =
     { model with
         Game = game
         Notice = notice
-        Shots = newShots @ model.Shots
+        Shots = model.Shots @ newShots
         Particles = allParticles
+        Shockwaves = allShockwaves
         FloatingTexts = allTexts
         ScreenShake = shake
         RedFlash = flash }
 
 let updateUi (layout: Layout) (msg: UiMsg) (model: UiModel) : UiModel =
     match msg with
-    | GameMsg gameMsg -> applyGame layout gameMsg model
+    | GameMsg gameMsg -> 
+        let nextModel = applyGame layout gameMsg model
+        match nextModel.Game.Status with
+        | Defeated waves ->
+            if waves > nextModel.MaxWaveReached then
+                { nextModel with MaxWaveReached = waves }
+            else nextModel
+        | Victory ->
+            // Unlock next level
+            let nextLevelId = nextModel.Game.LevelId + 1
+            let newUnlocked = Set.add nextLevelId nextModel.Campaign.UnlockedLevels
+            let newCampaign = { nextModel.Campaign with UnlockedLevels = newUnlocked }
+            { nextModel with Campaign = newCampaign }
+        | _ -> nextModel
+
+    | OpenTalentTree ->
+        let game = { model.Game with Status = TalentScreen }
+        { model with Game = game }
+
+    | CloseTalentTree ->
+        let game = { model.Game with Status = CampaignMenu }
+        { model with Game = game }
+
+
+    | UpgradeTalent talentName ->
+        let costFor level = level + 1
+        let t = model.Game.Talents
+        let totalSpent =
+            [ for i in 0 .. t.StartingGoldLevel - 1 -> costFor i ] @
+            [ for i in 0 .. t.ArcherDamageLevel - 1 -> costFor i ] @
+            [ for i in 0 .. t.CannonDamageLevel - 1 -> costFor i ] @
+            [ for i in 0 .. t.SpellCooldownLevel - 1 -> costFor i ]
+            |> List.sum
+        let available = model.MaxWaveReached - totalSpent
+        
+        let mutable newT = t
+        let mutable cost = 0
+        match talentName with
+        | "Gold" -> cost <- costFor t.StartingGoldLevel; if available >= cost then newT <- { t with StartingGoldLevel = t.StartingGoldLevel + 1 }
+        | "Archer" -> cost <- costFor t.ArcherDamageLevel; if available >= cost then newT <- { t with ArcherDamageLevel = t.ArcherDamageLevel + 1 }
+        | "Cannon" -> cost <- costFor t.CannonDamageLevel; if available >= cost then newT <- { t with CannonDamageLevel = t.CannonDamageLevel + 1 }
+        | "Spell" -> cost <- costFor t.SpellCooldownLevel; if available >= cost then newT <- { t with SpellCooldownLevel = t.SpellCooldownLevel + 1 }
+        | _ -> ()
+        
+        if newT <> t then
+            { model with Game = { model.Game with Talents = newT } }
+        else
+            model
 
     | PointerMoved(hover, pointer) ->
         { model with
@@ -344,12 +495,24 @@ let updateUi (layout: Layout) (msg: UiMsg) (model: UiModel) : UiModel =
         | Some coord ->
             match Grid.cellAt coord model.Game.Grid with
             | Occupied _ -> applyGame layout (SellTower coord) model
+            | BlockedCell
             | Empty ->
                 { model with Notice = Some("No tower to sell here.", noticeTtl) }
         | None ->
             { model with Notice = Some("Hover over a tower to sell it.", noticeTtl) }
 
-    | Restart -> init (Grid.size model.Game.Grid)
+    | StartGame ->
+        let game = { model.Game with Status = Playing (Lives.create startingLives) }
+        { model with Game = game }
+
+    | SelectLevel levelId ->
+        let levelDef = Levels.get levelId |> Option.get
+        let newModel = init model.Campaign levelDef model.MaxWaveReached
+        let game = { newModel.Game with Status = Playing (Lives.create startingLives) }
+        { newModel with Game = game }
+
+    | Restart -> 
+        init model.Campaign (Levels.get model.Game.LevelId |> Option.get) model.MaxWaveReached
 
     | Frame dt ->
         let seconds = DeltaTime.seconds dt
@@ -392,14 +555,42 @@ let updateUi (layout: Layout) (msg: UiMsg) (model: UiModel) : UiModel =
                 if ttl' <= 0.0 then None
                 else Some { ft with Y = ft.Y - 30.0 * seconds; Ttl = ttl' })
 
+        // 4.5 Advance shockwaves: expand radius and fade.
+        let shockwaves =
+            model.Shockwaves
+            |> List.choose (fun sw ->
+                let ttl' = sw.Ttl - seconds
+                if ttl' <= 0.0 then None
+                else
+                    // ease-out expansion
+                    let progress = 1.0 - (ttl' / sw.MaxTtl)
+                    let newRadius = sw.Radius + (sw.MaxRadius - sw.Radius) * (1.0 - (1.0 - progress) * (1.0 - progress))
+                    Some { sw with Ttl = ttl'; Radius = newRadius })
+
         // 5. Decay screen shake and red flash.
         let shake = max 0.0 (model.ScreenShake - seconds * 20.0)
         let flash = max 0.0 (model.RedFlash - seconds * 2.0)
+
+        // 6. Weather particles
+        let wParticles =
+            model.WeatherParticles
+            |> List.choose (fun p ->
+                let ttl' = p.Ttl - seconds
+                if ttl' <= 0.0 then None
+                else
+                    Some { p with
+                            X = p.X + p.Vx * seconds
+                            Y = p.Y + p.Vy * seconds
+                            Ttl = ttl' })
+        let newWParticles = spawnWeather model.Game.Theme
+        let wParticles = wParticles @ newWParticles
 
         { model with
             Notice = notice
             Shots = shots
             Particles = particles
+            Shockwaves = shockwaves
+            WeatherParticles = wParticles
             FloatingTexts = floatingTexts
             ScreenShake = shake
             RedFlash = flash }

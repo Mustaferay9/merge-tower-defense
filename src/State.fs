@@ -26,6 +26,7 @@ type DragState =
 type Interaction =
     | Idle
     | Dragging of DragState
+    | CastingSpell of ActiveSpell
 
 // ---------------------------------------------------------------------------
 // Waves and game status
@@ -48,8 +49,11 @@ type WaveState =
 /// Lives only exist while playing; a defeated game has no life counter to
 /// misread. Running out of lives is the one-way transition to Defeated.
 type GameStatus =
+    | CampaignMenu
     | Playing of Lives
     | Defeated of wavesSurvived: int
+    | Victory
+    | TalentScreen
 
 /// The difficulty curve: what each wave throws at the player and what the
 /// player earns for surviving it. Pure functions of the wave number.
@@ -73,30 +77,37 @@ module Waves =
     /// grunts, so entering Spawning with an empty queue is unrepresentable
     /// in practice (and handled anyway).
     let composition (wave: int) : EnemyType list =
-        let grunts = List.replicate (3 + wave) Grunt
-        let runners = if wave >= 2 then List.replicate (wave - 1) Runner else []
-        let tanks = if wave >= 4 then List.replicate ((wave - 2) / 2) Tank else []
-        let bosses = if wave % 5 = 0 then List.replicate (wave / 5) Boss else []
-        grunts @ runners @ tanks @ bosses
+        if wave > 0 && wave % 5 = 0 then
+            if wave % 10 = 0 then [ MegaBoss ] else [ Necromancer ]
+        else
+            let bandits = List.replicate (3 + wave) Bandit
+            let cavalry = if wave >= 2 then List.replicate (wave - 1) Cavalry else []
+            let brutes = if wave >= 4 then List.replicate ((wave - 2) / 2) Brute else []
+            let warlords = if wave > 0 && wave % 4 = 0 then List.replicate (wave / 4) Warlord else []
+            bandits @ cavalry @ brutes @ warlords
 
 // ---------------------------------------------------------------------------
 // Game state
 // ---------------------------------------------------------------------------
 
 type GameState =
-    { Grid: Grid
+    { LevelId: LevelId
+      Grid: Grid
+      Theme: MapTheme
+      Talents: Talents
       Interaction: Interaction
       Enemies: Enemy list
       TowerIds: TowerIdGen
       EnemyIds: EnemyIdGen
       Path: Path
       Wave: WaveState
+      WaveCount: int
       Gold: Gold
       /// Towers bought so far; drives the escalating purchase price.
       TowersBought: int
-      Status: GameStatus }
+      Status: GameStatus
+      GlobalTime: float }
 
-let startingGold = 110
 let startingLives = 10
 let towerBaseCost = 20
 let towerCostGrowth = 4
@@ -111,17 +122,23 @@ let sellValue (tower: Tower) =
     int (round (float towerBaseCost * float (pown 2 (rank - 1)) * 0.6))
 
 module GameState =
-    let create (size: GridSize) =
-        { Grid = Grid.create size
+    let create (level: LevelDef) (talents: Talents) =
+
+        { LevelId = level.Id
+          Grid = Grid.create level.Size (MapTheme.blockedCells level.Theme level.Size)
+          Theme = level.Theme
+          Talents = talents
           Interaction = Idle
           Enemies = []
           TowerIds = TowerIdGen.initial
           EnemyIds = EnemyIdGen.initial
-          Path = Path.defaultFor size
+          Path = MapTheme.path level.Theme level.Size
           Wave = { Number = 0; Phase = BetweenWaves Waves.initialDelay }
-          Gold = Gold.zero |> Gold.earn startingGold
+          WaveCount = level.WaveCount
+          Gold = Gold.zero |> Gold.earn level.StartingGold |> Gold.earn (Talents.startingGold talents)
           TowersBought = 0
-          Status = Playing(Lives.create startingLives) }
+          Status = Playing (Lives.create startingLives)
+          GlobalTime = 0.0 }
 
 // ---------------------------------------------------------------------------
 // Messages, events, rejections
@@ -140,6 +157,7 @@ type RejectReason =
     | NotEnoughGold of required: int
     | UnknownEnemy of EnemyId
     | GameAlreadyOver
+    | Busy
 
 /// Facts about what a transition did — the UI renders these; tests assert on
 /// them. Events describe the past, so they carry the concrete values.
@@ -152,15 +170,16 @@ type GameEvent =
     | TowerBought of tower: Tower * at: Coord * cost: int
     | TowerSold of tower: Tower * at: Coord * refund: int
     /// A shot was fired from a tower cell at a target position (cell units).
-    | TowerFired of TowerId * Coord * (float * float)
+    | TowerFired of TowerType * TowerId * Coord * (float * float)
     | WaveStarted of wave: int
     | WaveCompleted of wave: int * bonus: int
     | EnemySpawned of Enemy
     | EnemyReachedGoal of EnemyId
-    | LifeLost of remaining: int
-    | EnemyDamaged of EnemyId * remaining: Health
+    | EnemyDamaged of EnemyId * damage: int * remaining: Health
     | EnemyKilled of EnemyId * bounty: int
     | EnemySlowed of EnemyId
+    | SpellCast of ActiveSpell * target: Coord
+    | LifeLost of remaining: int
     | GameOver of wavesSurvived: int
     | ActionRejected of RejectReason
 
@@ -177,6 +196,8 @@ type Msg =
     | SpawnTower of TowerType * Coord
     | SpawnEnemy of EnemyType
     | HitEnemy of EnemyId * Damage
+    | StartSpellCast of ActiveSpell
+    | CastSpell of ActiveSpell * Coord
 
 // ---------------------------------------------------------------------------
 // Drop preview (pure derivation for UI highlighting)
@@ -200,10 +221,12 @@ let previewDrop (target: Coord) (state: GameState) : DropPreview option =
         else
             match Grid.cellAt target state.Grid with
             | Empty -> Some MoveHere
+            | BlockedCell -> Some Blocked
             | Occupied other ->
                 match Tower.canMerge drag.Tower other with
                 | Some level -> Some(MergeHere level)
                 | None -> Some Blocked
+    | CastingSpell _ -> None
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -271,26 +294,41 @@ let private stepWave (dtSeconds: float) (state: GameState) =
 /// Also decrements Frost slow timers.
 let private stepMovement (dt: DeltaTime) (state: GameState) =
     let dtSeconds = DeltaTime.seconds dt
-    let folder (survivors, status, events) (enemy: Enemy) =
-        let enemy = Enemy.tickSlow dtSeconds enemy
-        match Enemy.advance state.Path dt enemy with
-        | Moved progress -> { enemy with Progress = progress } :: survivors, status, events
+    let folder (survivors, status, events, idGen) (enemy: Enemy) =
+        let enemy = Enemy.tickCooldowns dtSeconds enemy
+
+        let newMinions, enemy', newGen, spawnEvents =
+            if enemy.SpawnCooldown <= 0.0 && (enemy.Type = MegaBoss || enemy.Type = Necromancer) then
+                let spawnType = if enemy.Type = MegaBoss then Cavalry else Bandit
+                let minion, gen' = Enemy.spawnWith idGen spawnType (Waves.healthMultiplier state.Wave.Number)
+                let minion = { minion with Progress = enemy.Progress }
+                let newCooldown = match enemy.Type with MegaBoss -> 4.0 | Necromancer -> 6.0 | _ -> 0.0
+                [ minion ], { enemy with SpawnCooldown = newCooldown }, gen', [ EnemySpawned minion ]
+            else
+                [], enemy, idGen, []
+
+        match Enemy.advance state.Path dt enemy' with
+        | Moved progress -> newMinions @ ({ enemy' with Progress = progress } :: survivors), status, events @ spawnEvents, newGen
         | ReachedGoal ->
-            let events = events @ [ EnemyReachedGoal enemy.Id ]
+            let events = events @ spawnEvents @ [ EnemyReachedGoal enemy'.Id ]
 
             match status with
-            | Defeated _ -> survivors, status, events
+            | CampaignMenu
+            | TalentScreen
+            | Defeated _
+            | Victory -> survivors, status, events, newGen
             | Playing lives ->
-                match Lives.lose (EnemyType.livesCost enemy.Type) lives with
-                | StillAlive lives' -> survivors, Playing lives', events @ [ LifeLost(Lives.value lives') ]
+                match Lives.lose (EnemyType.livesCost enemy'.Type) lives with
+                | StillAlive lives' -> survivors, Playing lives', events @ [ LifeLost(Lives.value lives') ], newGen
                 | AllLost ->
                     let survived = max 0 (state.Wave.Number - 1)
-                    survivors, Defeated survived, events @ [ LifeLost 0; GameOver survived ]
+                    survivors, Defeated survived, events @ [ LifeLost 0; GameOver survived ], newGen
 
-    let survivorsRev, status, events =
-        List.fold folder ([], state.Status, []) state.Enemies
+    let survivorsRev, status, events, finalGen =
+        List.fold folder ([], state.Status, [], state.EnemyIds) state.Enemies
 
     { state with
+        EnemyIds = finalGen
         Enemies = List.rev survivorsRev
         Status = status },
     events
@@ -300,6 +338,9 @@ let private stepMovement (dt: DeltaTime) (state: GameState) =
 /// Towers are processed in deterministic coordinate order.
 let private stepCombat (dtSeconds: float) (state: GameState) =
     match state.Status with
+    | CampaignMenu
+    | TalentScreen
+    | Victory
     | Defeated _ -> state, []
     | Playing _ ->
         let cooled =
@@ -310,8 +351,20 @@ let private stepCombat (dtSeconds: float) (state: GameState) =
             if tower.Cooldown > 0.0 then
                 enemies, gold, resets, events
             else
-                let stats = Tower.stats tower
+                let stats = Tower.stats tower state.Talents
                 let tx, ty = Coord.center coord
+
+                let neighbors =
+                    [ (-1, 0); (1, 0); (0, -1); (0, 1) ]
+                    |> List.choose (fun (dr, dc) -> Coord.tryCreate (Grid.size state.Grid) (Coord.row coord + dr) (Coord.col coord + dc))
+                    |> List.choose (fun c -> match Grid.cellAt c state.Grid with Occupied t -> Some t | _ -> None)
+
+                let isFrostAdjacent = neighbors |> List.exists (fun t -> t.Type = Frost)
+                let isCannonAdjacent = neighbors |> List.exists (fun t -> t.Type = Cannon)
+
+                let finalDamage = if tower.Type = Cannon && isCannonAdjacent then stats.Damage + (stats.Damage / 2) else stats.Damage
+                let finalCooldownMs = if tower.Type = Archer && isFrostAdjacent then int (float stats.CooldownMs * 0.6) else stats.CooldownMs
+                let damage = Damage.tryCreate finalDamage |> Option.get
 
                 let inRange (enemy: Enemy) =
                     let ex, ey = Enemy.positionOn state.Path enemy
@@ -325,10 +378,10 @@ let private stepCombat (dtSeconds: float) (state: GameState) =
                     let target =
                         candidates |> List.maxBy (fun e -> PathProgress.value e.Progress)
 
-                    let resets = Map.add tower.Id (float stats.CooldownMs / 1000.0) resets
-                    let fired = TowerFired(tower.Id, coord, Enemy.positionOn state.Path target)
+                    let resets = Map.add tower.Id (float finalCooldownMs / 1000.0) resets
+                    let fired = TowerFired(tower.Type, tower.Id, coord, Enemy.positionOn state.Path target)
 
-                    match AttackResult.ofDamage (Tower.attackDamage tower) target.Health with
+                    match AttackResult.ofDamage damage target.Health with
                     | Survived remaining ->
                         let slowEvents =
                             if tower.Type = Frost && target.SlowUntil <= 0.0 then [ EnemySlowed target.Id ] else []
@@ -342,14 +395,14 @@ let private stepCombat (dtSeconds: float) (state: GameState) =
                             else e),
                         gold,
                         resets,
-                        events @ [ fired; EnemyDamaged(target.Id, remaining) ] @ slowEvents
+                        events @ [ fired; EnemyDamaged(target.Id, Damage.value damage, remaining) ] @ slowEvents
                     | Killed ->
                         let bounty = EnemyType.bounty target.Type
 
                         enemies |> List.filter (fun e -> e.Id <> target.Id),
                         Gold.earn bounty gold,
                         resets,
-                        events @ [ fired; EnemyKilled(target.Id, bounty) ]
+                        events @ [ fired; EnemyDamaged(target.Id, Damage.value damage, target.Health); EnemyKilled(target.Id, bounty) ]
 
         let enemies, gold, resets, events =
             Grid.towers cooled
@@ -374,10 +427,14 @@ let private checkWaveCompletion (state: GameState) =
     match state.Status, state.Wave.Phase with
     | Playing _, WaveActive when List.isEmpty state.Enemies ->
         let bonus = Waves.completionBonus state.Wave.Number
-
-        { state with Gold = Gold.earn bonus state.Gold }
-        |> withPhase (BetweenWaves Waves.interWaveDelay),
-        [ WaveCompleted(state.Wave.Number, bonus) ]
+        let stateWithGold = { state with Gold = Gold.earn bonus state.Gold }
+        if state.Wave.Number >= state.WaveCount then
+            { stateWithGold with Status = Victory },
+            [ WaveCompleted(state.Wave.Number, bonus) ]
+        else
+            stateWithGold
+            |> withPhase (BetweenWaves Waves.interWaveDelay),
+            [ WaveCompleted(state.Wave.Number, bonus) ]
     | _ -> state, []
 
 // ---------------------------------------------------------------------------
@@ -395,7 +452,8 @@ let private updatePlaying (msg: Msg) (state: GameState) : GameState * GameEvent 
         let state2, events2 = stepMovement dt state1
         let state3, events3 = stepCombat dtSeconds state2
         let state4, events4 = checkWaveCompletion state3
-        state4, events1 @ events2 @ events3 @ events4
+        let finalState = { state4 with GlobalTime = state.GlobalTime + dtSeconds }
+        finalState, events1 @ events2 @ events3 @ events4
 
     // -- drag & drop / merge ------------------------------------------------
 
@@ -408,10 +466,12 @@ let private updatePlaying (msg: Msg) (state: GameState) : GameState * GameEvent 
                 Interaction = Dragging { Origin = origin; Tower = tower } },
             [ DragBegan(tower, origin) ]
 
+    | StartDrag _, CastingSpell _ -> state, [ ActionRejected Busy ]
     | StartDrag _, Dragging _ -> state, [ ActionRejected AlreadyDragging ]
 
     | Drop _, Idle -> state, [ ActionRejected NotDragging ]
 
+    | Drop _, CastingSpell _ -> state, [ ActionRejected Busy ]
     | Drop target, Dragging drag when target = drag.Origin ->
         { state with
             Grid = placeOnEmpty drag.Origin drag.Tower state.Grid
@@ -419,14 +479,19 @@ let private updatePlaying (msg: Msg) (state: GameState) : GameState * GameEvent 
         [ TowerReturned(drag.Tower, drag.Origin) ]
 
     | Drop target, Dragging drag ->
-        match Grid.tryLift target state.Grid with
-        | None ->
-            // Target cell is empty: plain move.
+        match Grid.cellAt target state.Grid with
+        | BlockedCell ->
+            { state with
+                Grid = placeOnEmpty drag.Origin drag.Tower state.Grid
+                Interaction = Idle },
+            [ ActionRejected (SpawnCellOccupied target); TowerReturned(drag.Tower, drag.Origin) ]
+        | Empty ->
             { state with
                 Grid = placeOnEmpty target drag.Tower state.Grid
                 Interaction = Idle },
             [ TowerMoved(drag.Tower, drag.Origin, target) ]
-        | Some(targetTower, gridWithoutTarget) ->
+        | Occupied targetTower ->
+            let _, gridWithoutTarget = Grid.tryLift target state.Grid |> Option.get
             match Tower.canMerge drag.Tower targetTower with
             | Some mergedLevel ->
                 let mergedId, towerIds = TowerIdGen.next state.TowerIds
@@ -460,6 +525,9 @@ let private updatePlaying (msg: Msg) (state: GameState) : GameState * GameEvent 
             Interaction = Idle },
         [ TowerReturned(drag.Tower, drag.Origin) ]
 
+    | CancelDrag, CastingSpell _ ->
+        { state with Interaction = Idle }, []
+
     | CancelDrag, Idle -> state, [ ActionRejected NotDragging ]
 
     // -- economy: buying towers ----------------------------------------------
@@ -467,12 +535,14 @@ let private updatePlaying (msg: Msg) (state: GameState) : GameState * GameEvent 
     // Rejected mid-drag: this is what keeps the drag origin provably empty
     // for the whole gesture (see placeOnEmpty).
     | BuyTower _, Dragging _ -> state, [ ActionRejected SpawnWhileDragging ]
+    | BuyTower _, CastingSpell _ -> state, [ ActionRejected Busy ]
 
     | BuyTower(towerType, coord), Idle ->
         let cost = nextTowerCost state
 
         match Grid.cellAt coord state.Grid with
-        | Occupied _ -> state, [ ActionRejected(SpawnCellOccupied coord) ]
+        | Occupied _ 
+        | BlockedCell -> state, [ ActionRejected(SpawnCellOccupied coord) ]
         | Empty ->
             match Gold.trySpend cost state.Gold with
             | None -> state, [ ActionRejected(NotEnoughGold cost) ]
@@ -495,6 +565,7 @@ let private updatePlaying (msg: Msg) (state: GameState) : GameState * GameEvent 
     // -- economy: selling towers ----------------------------------------------
 
     | SellTower _, Dragging _ -> state, [ ActionRejected SpawnWhileDragging ]
+    | SellTower _, CastingSpell _ -> state, [ ActionRejected Busy ]
 
     | SellTower coord, Idle ->
         match Grid.tryLift coord state.Grid with
@@ -507,6 +578,7 @@ let private updatePlaying (msg: Msg) (state: GameState) : GameState * GameEvent 
     // -- test/tooling messages ------------------------------------------------
 
     | SpawnTower _, Dragging _ -> state, [ ActionRejected SpawnWhileDragging ]
+    | SpawnTower _, CastingSpell _ -> state, [ ActionRejected Busy ]
 
     | SpawnTower(towerType, coord), Idle ->
         let id, towerIds = TowerIdGen.next state.TowerIds
@@ -543,19 +615,66 @@ let private updatePlaying (msg: Msg) (state: GameState) : GameState * GameEvent 
                     state.Enemies
                     |> List.map (fun e -> if e.Id = enemyId then { e with Health = remaining } else e)
 
-                { state with Enemies = enemies }, [ EnemyDamaged(enemyId, remaining) ]
+                { state with Enemies = enemies }, [ EnemyDamaged(enemyId, Damage.value damage, remaining) ]
             | Killed ->
                 let bounty = EnemyType.bounty enemy.Type
 
                 { state with
                     Enemies = state.Enemies |> List.filter (fun e -> e.Id <> enemyId)
                     Gold = Gold.earn bounty state.Gold },
-                [ EnemyKilled(enemyId, bounty) ]
+                [ EnemyDamaged(enemyId, Damage.value damage, enemy.Health); EnemyKilled(enemyId, bounty) ]
+
+    // -- spells --------------------------------------------------------------
+
+    | StartSpellCast spell, _ ->
+        { state with Interaction = CastingSpell spell }, []
+
+    | CastSpell (spell, targetCoord), CastingSpell currentSpell when spell = currentSpell ->
+        let cost = int (float (ActiveSpell.cost spell) * Talents.spellCooldownMult state.Talents)
+        match Gold.trySpend cost state.Gold with
+        | None -> state, [ ActionRejected (NotEnoughGold cost) ]
+        | Some gold ->
+            let radius = ActiveSpell.radius spell
+            let rSq = radius * radius
+            let distSq (x1, y1) (x2, y2) = (x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2)
+            
+            let tx, ty = Coord.center targetCoord
+
+            let finalEnemies, goldEarned, events =
+                state.Enemies
+                |> List.fold (fun (accEnemies, accGold, accEvents) enemy ->
+                    let ex, ey = Enemy.positionOn state.Path enemy
+                    if distSq (ex, ey) (tx, ty) <= rSq then
+                        match spell with
+                        | ActiveSpell.Fireball ->
+                            let dmg = Damage.tryCreate 50 |> Option.get
+                            match AttackResult.ofDamage dmg enemy.Health with
+                            | Survived remaining ->
+                                { enemy with Health = remaining } :: accEnemies, accGold, EnemyDamaged(enemy.Id, 50, remaining) :: accEvents
+                            | Killed ->
+                                let bounty = EnemyType.bounty enemy.Type
+                                accEnemies, accGold + bounty, EnemyKilled(enemy.Id, bounty) :: EnemyDamaged(enemy.Id, 50, enemy.Health) :: accEvents
+                        | ActiveSpell.FrostNova ->
+                            { enemy with SlowUntil = enemy.SlowUntil + 5.0 } :: accEnemies, accGold, EnemySlowed(enemy.Id) :: accEvents
+                    else
+                        enemy :: accEnemies, accGold, accEvents
+                ) ([], 0, [])
+
+            { state with
+                Gold = Gold.earn goldEarned gold
+                Enemies = List.rev finalEnemies
+                Interaction = Idle }, (SpellCast (spell, targetCoord) :: List.rev events)
+
+    | CastSpell _, _ -> state, [ ActionRejected Busy ]
 
 let update (msg: Msg) (state: GameState) : GameState * GameEvent list =
     match state.Status with
-    | Defeated _ ->
-        // The tableau is frozen after defeat; time passing is a silent no-op,
+    | CampaignMenu
+    | TalentScreen ->
+        // No core events are processed in CampaignMenu or TalentScreen. The UI transitions out of this state.
+        state, []
+    | Defeated _ | Victory ->
+        // The tableau is frozen after defeat/victory; time passing is a silent no-op,
         // every attempted action is an explicit rejection.
         match msg with
         | Tick _ -> state, []

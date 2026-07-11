@@ -40,6 +40,7 @@ type Graphics =
     abstract drawPolygon: points: obj [] -> Graphics
     abstract moveTo: x: float * y: float -> Graphics
     abstract lineTo: x: float * y: float -> Graphics
+    abstract blendMode: obj with get, set
 
 type Ticker =
     abstract deltaMS: float

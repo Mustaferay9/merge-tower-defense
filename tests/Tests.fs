@@ -13,6 +13,7 @@ open MergeTowerDefense.Ui
 
 let mutable private passed = 0
 let mutable private failed = 0
+let startingGold = Talents.startingGold Talents.empty
 
 let private check (name: string) (condition: bool) =
     if condition then
@@ -35,6 +36,16 @@ let private coordIn (size: GridSize) r c =
     | Some coord -> coord
     | None -> failwith "test setup: invalid coord"
 
+let dummyLevel (size: GridSize) =
+    { Id = 0
+      Name = "Dummy"
+      Description = "Dummy"
+      Size = size
+      Theme = MapTheme.Plain
+      AllowedTowers = Set.empty
+      StartingGold = 0
+      WaveCount = 5 }
+
 let private size5 = gridSize 5
 let private at r c = coordIn size5 r c
 
@@ -47,7 +58,7 @@ let private run (msgs: Msg list) (initial: GameState) : GameState * GameEvent li
             state', log @ events)
         (initial, [])
 
-let private fresh () = GameState.create size5
+let private fresh () = GameState.create (dummyLevel size5) Talents.empty
 
 /// Pushes the next wave far into the future so tests can exercise movement,
 /// combat and economy without the scheduler interfering.
@@ -354,7 +365,7 @@ let private testMaxLevel () =
     let spawns =
         [ for i in 0 .. 31 -> SpawnTower(Archer, coord8 (i / 8) (i % 8)) ]
 
-    let filled, _ = GameState.create size8 |> run spawns
+    let filled, _ = GameState.create (dummyLevel size8) Talents.empty |> run spawns
     let merged = mergeDown filled
 
     let levels =
@@ -419,7 +430,7 @@ let private testPreviewConsistency () =
 
 let private testEnemies () =
     let state, evs =
-        fresh () |> noWaves |> run [ SpawnEnemy Grunt; SpawnEnemy Runner ]
+        fresh () |> noWaves |> run [ SpawnEnemy Bandit; SpawnEnemy Cavalry ]
 
     check "spawned enemies are tracked" (List.length state.Enemies = 2)
     check "enemies spawn at path start"
@@ -453,24 +464,24 @@ let private testEnemies () =
     let s, evs = state |> run [ HitEnemy(grunt.Id, dmg 15) ]
     check "wounded enemy survives with reduced hp"
         (match evs with
-         | [ EnemyDamaged(id, remaining) ] -> id = grunt.Id && Health.value remaining = 5
+         | [ EnemyDamaged(id, _, remaining) ] -> id = grunt.Id && Health.value remaining = 5
          | _ -> false)
     check "wounded enemy stays on the field" (List.length s.Enemies = 2)
 
     let s2, evs = s |> run [ HitEnemy(grunt.Id, dmg 5) ]
     check "lethal damage kills with bounty"
         (match evs with
-         | [ EnemyKilled(id, bounty) ] -> id = grunt.Id && bounty = EnemyType.bounty Grunt
+         | [ EnemyDamaged(_); EnemyKilled(id, bounty) ] -> id = grunt.Id && bounty = EnemyType.bounty Bandit
          | _ -> false)
     check "killed enemy is removed" (List.length s2.Enemies = 1)
-    check "kill pays the bounty" (goldOf s2 = goldOf s + EnemyType.bounty Grunt)
+    check "kill pays the bounty" (goldOf s2 = goldOf s + EnemyType.bounty Bandit)
 
     let _, evs = s2 |> run [ HitEnemy(grunt.Id, dmg 1) ]
     check "hitting a dead enemy is rejected" (hasReject (UnknownEnemy grunt.Id) evs)
 
     check "overkill also kills"
         (match state |> run [ HitEnemy(grunt.Id, dmg 9999) ] with
-         | _, [ EnemyKilled _ ] -> true
+         | _, [ EnemyDamaged(_); EnemyKilled _ ] -> true
          | _ -> false)
 
 // ---------------------------------------------------------------------------
@@ -494,10 +505,10 @@ let private testWaves () =
 
     // Difficulty curve: composition grows and health scales.
     check "wave 1 is grunts only"
-        (Waves.composition 1 |> List.forall (fun t -> t = Grunt))
-    check "later waves add runners" (Waves.composition 3 |> List.contains Runner)
-    check "later waves add tanks" (Waves.composition 4 |> List.contains Tank)
-    check "every fifth wave has a boss" (Waves.composition 5 |> List.contains Boss)
+        (Waves.composition 1 |> List.forall (fun t -> t = Bandit))
+    check "later waves add runners" (Waves.composition 3 |> List.contains Cavalry)
+    check "later waves add tanks" (Waves.composition 4 |> List.contains Brute)
+    check "every fifth wave has a boss" (Waves.composition 5 |> List.contains Necromancer)
     check "waves grow over time"
         (List.length (Waves.composition 8) > List.length (Waves.composition 1))
     check "health multiplier grows" (Waves.healthMultiplier 6 > Waves.healthMultiplier 1)
@@ -516,7 +527,7 @@ let private testWaves () =
 
 let private testCombat () =
     // Archer at (0,0) covers the path entry; a grunt walks into its range.
-    let armed, _ = fresh () |> noWaves |> run [ SpawnTower(Archer, at 0 0); SpawnEnemy Grunt ]
+    let armed, _ = fresh () |> noWaves |> run [ SpawnTower(Archer, at 0 0); SpawnEnemy Bandit ]
 
     let afterShot, evs = armed |> run [ Tick(dt 0.05) ]
     check "ready tower fires immediately"
@@ -540,13 +551,13 @@ let private testCombat () =
     check "sustained fire kills the enemy"
         (evsAll |> List.exists (fun e -> match e with EnemyKilled _ -> true | _ -> false))
     check "the field is cleared" (cleared.Enemies = [])
-    check "combat pays the bounty" (goldOf cleared = startingGold + EnemyType.bounty Grunt)
+    check "combat pays the bounty" (goldOf cleared = startingGold + EnemyType.bounty Bandit)
     check "no lives were lost" (livesOf cleared = startingLives)
 
     // Out-of-range towers never fire: bottom-left corner is far from the path.
     let idle, evsIdle =
         fresh () |> noWaves
-        |> run [ SpawnTower(Cannon, at 4 0); SpawnEnemy Grunt ]
+        |> run [ SpawnTower(Cannon, at 4 0); SpawnEnemy Bandit ]
         |> fst
         |> ticks 10 0.1
 
@@ -556,11 +567,11 @@ let private testCombat () =
 
     // "First" targeting: the enemy furthest along the path is hit first.
     let twoEnemies, _ =
-        fresh () |> noWaves |> run [ SpawnEnemy Grunt ]
+        fresh () |> noWaves |> run [ SpawnEnemy Bandit ]
         |> fst
         |> run [ Tick(dt 1.0) ] // let the first grunt walk ahead
         |> fst
-        |> run [ SpawnEnemy Grunt; SpawnTower(Archer, at 0 0) ]
+        |> run [ SpawnEnemy Bandit; SpawnTower(Archer, at 0 0) ]
 
     let leader =
         twoEnemies.Enemies |> List.maxBy (fun e -> PathProgress.value e.Progress)
@@ -570,7 +581,7 @@ let private testCombat () =
         (evsTarget
          |> List.exists (fun e ->
              match e with
-             | EnemyDamaged(id, _) -> id = leader.Id
+             | EnemyDamaged(id, _, _) -> id = leader.Id
              | _ -> false))
 
 // ---------------------------------------------------------------------------
@@ -606,7 +617,7 @@ let private testEconomy () =
 
     // Clearing a wave pays the completion bonus.
     let beforeClear, _ =
-        fresh () |> noWaves |> run [ SpawnEnemy Grunt; SpawnTower(Archer, at 0 0) ]
+        fresh () |> noWaves |> run [ SpawnEnemy Bandit; SpawnTower(Archer, at 0 0) ]
 
     let waveActive =
         { beforeClear with Wave = { Number = 1; Phase = WaveActive } }
@@ -615,7 +626,7 @@ let private testEconomy () =
     check "clearing the wave pays the bonus"
         (evsC |> List.contains (WaveCompleted(1, Waves.completionBonus 1)))
     check "bonus lands in the purse"
-        (goldOf cleared = startingGold + EnemyType.bounty Grunt + Waves.completionBonus 1)
+        (goldOf cleared = startingGold + EnemyType.bounty Bandit + Waves.completionBonus 1)
     check "next wave countdown starts"
         (match cleared.Wave.Phase with
          | BetweenWaves _ -> true
@@ -628,7 +639,7 @@ let private testEconomy () =
 let private testGameOver () =
     // Ten grunt leaks exhaust the starting lives.
     let flooded, _ =
-        fresh () |> noWaves |> run [ for _ in 1 .. startingLives -> SpawnEnemy Grunt ]
+        fresh () |> noWaves |> run [ for _ in 1 .. startingLives -> SpawnEnemy Bandit ]
 
     let ended, evs = flooded |> run [ Tick(dt 1000.0) ]
 
@@ -653,7 +664,7 @@ let private testGameOver () =
 
 let private testImmutability () =
     let before = fresh ()
-    let after, _ = before |> run [ SpawnTower(Archer, at 0 0); SpawnEnemy Boss ]
+    let after, _ = before |> run [ SpawnTower(Archer, at 0 0); SpawnEnemy MegaBoss ]
 
     check "update never mutates the old state"
         (Grid.towerCount before.Grid = 0
@@ -681,12 +692,12 @@ let private testStats () =
         { Id = idB; Type = Archer; Level = Level3; Cooldown = 0.0 }
 
     check "stats scale with level"
-        ((Tower.stats archer3).Damage = 4 * (Tower.stats archer1).Damage)
+        ((Tower.stats archer3 Talents.empty).Damage = 4 * (Tower.stats archer1 Talents.empty).Damage)
     check "range grows with level"
-        ((Tower.stats archer3).Range > (Tower.stats archer1).Range)
+        ((Tower.stats archer3 Talents.empty).Range > (Tower.stats archer1 Talents.empty).Range)
     check "same tower cannot merge with itself" (Tower.canMerge archer1 archer1 = None)
     check "attack damage matches stats"
-        (Damage.value (Tower.attackDamage archer3) = (Tower.stats archer3).Damage)
+        (Damage.value (Tower.attackDamage archer3 Talents.empty) = (Tower.stats archer3 Talents.empty).Damage)
 
 // ---------------------------------------------------------------------------
 // UI layer: layout math, hit testing, HUD transitions
@@ -698,7 +709,7 @@ let private uiLayoutTests () =
 
     // cellAtPoint must be the exact inverse of cellCenter on every cell.
     let allRoundTrip =
-        GameState.create size5
+        GameState.create (dummyLevel size5) Talents.empty
         |> fun s -> Grid.coords s.Grid
         |> List.forall (fun coord ->
             let x, y = cellCenter layout coord
@@ -719,13 +730,13 @@ let private uiLayoutTests () =
         (Path.waypoints path5 |> List.forall containsPoint)
 
     check "enemy at path start renders at the first waypoint"
-        (let e, _ = Enemy.spawn EnemyIdGen.initial Grunt
+        (let e, _ = Enemy.spawn EnemyIdGen.initial Bandit
          Enemy.positionOn path5 e = List.head (Path.waypoints path5))
 
 let private uiHudTests () =
     let path5 = Path.defaultFor size5
     let layout = layoutFor size5 path5
-    let model = init size5
+    let model = init CampaignState.empty (Levels.get 1 |> Option.get) 1 |> updateUi layout StartGame
 
     // Buying through the HUD: first empty cell, gold drawn from the core.
     let m1 = updateUi layout (Buy Archer) model
@@ -753,7 +764,7 @@ let private uiHudTests () =
 
     // Shot tracers appear when towers fire and fade out.
     let combatModel =
-        { model with Game = fst (run [ SpawnTower(Archer, at 0 0); SpawnEnemy Grunt ] (noWaves model.Game)) }
+        { model with Game = fst (run [ SpawnTower(Archer, at 0 0); SpawnEnemy Bandit ] (noWaves model.Game)) }
 
     let firing = updateUi layout (Frame(dt 0.05)) combatModel
     check "tower fire leaves a shot tracer" (not (List.isEmpty firing.Shots))
@@ -792,7 +803,7 @@ let private testFrostSlow () =
     // Place a frost tower and an enemy, then tick. The frost tower should
     // slow the enemy after hitting it.
     let initial = fresh () |> noWaves
-    let state, _ = run [ SpawnTower(Frost, at 0 0); SpawnEnemy Grunt ] initial
+    let state, _ = run [ SpawnTower(Frost, at 0 0); SpawnEnemy Bandit ] initial
 
     // Tick until the frost tower fires (its cooldown is 0 at spawn).
     let state1, events1 = ticks 1 0.05 state
@@ -815,7 +826,7 @@ let private testFrostSlow () =
 
     // Movement under slow is reduced: advance the enemy for 1s while slowed
     // and compare with an unslowed enemy.
-    let unslowedEnemy, _ = Enemy.spawn EnemyIdGen.initial Grunt
+    let unslowedEnemy, _ = Enemy.spawn EnemyIdGen.initial Bandit
     let pathForTest = Path.defaultFor size5
     let dtOne = dt 1.0
     let slowedResult = Enemy.advance pathForTest dtOne { unslowedEnemy with SlowUntil = 1.0 }
@@ -827,7 +838,7 @@ let private testFrostSlow () =
          | _ -> false)
 
     // Slow decays after its duration.
-    let tickedSlow = Enemy.tickSlow 2.0 { unslowedEnemy with SlowUntil = 1.5 }
+    let tickedSlow = Enemy.tickCooldowns 2.0 { unslowedEnemy with SlowUntil = 1.5 }
     check "slow timer decays to zero" (tickedSlow.SlowUntil = 0.0)
 
 // ---------------------------------------------------------------------------
@@ -870,7 +881,7 @@ let private testSellTower () =
 let private testParticles () =
     let path5 = Path.defaultFor size5
     let layout = layoutFor size5 path5
-    let model = init size5
+    let model = init CampaignState.empty (Levels.get 1 |> Option.get) 1 |> updateUi layout StartGame
 
     // Merge two archers and check that particles are generated.
     let withTowers =

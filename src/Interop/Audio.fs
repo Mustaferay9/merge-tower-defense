@@ -109,3 +109,84 @@ let playBuy () = osc 1046.0 "sine" 0.05 0.08
 
 /// Softer reverse ching for selling.
 let playSell () = oscSweep 1046.0 523.0 "sine" 0.08 0.07
+
+let playSpellFireball () : unit =
+    match ctx with
+    | None -> ()
+    | Some c ->
+        let o = c.createOscillator ()
+        let g = c.createGain ()
+        let t = c.currentTime
+        o?``type`` <- "square"
+        o?frequency?setValueAtTime(100.0, t) |> ignore
+        o?frequency?linearRampToValueAtTime(20.0, t + 0.5) |> ignore
+        g?gain?setValueAtTime(0.1, t) |> ignore
+        g?gain?exponentialRampToValueAtTime(0.001, t + 0.5) |> ignore
+        o?connect(g) |> ignore
+        g?connect(c.destination) |> ignore
+        o?start(t) |> ignore
+        o?stop(t + 0.5) |> ignore
+
+let playSpellFrostNova () : unit =
+    match ctx with
+    | None -> ()
+    | Some c ->
+        let o = c.createOscillator ()
+        let g = c.createGain ()
+        let t = c.currentTime
+        o?``type`` <- "sine"
+        o?frequency?setValueAtTime(800.0, t) |> ignore
+        o?frequency?linearRampToValueAtTime(1200.0, t + 0.8) |> ignore
+        g?gain?setValueAtTime(0.05, t) |> ignore
+        g?gain?linearRampToValueAtTime(0.0, t + 0.8) |> ignore
+        o?connect(g) |> ignore
+        g?connect(c.destination) |> ignore
+        o?start(t) |> ignore
+        o?stop(t + 0.8) |> ignore
+
+// ---------------------------------------------------------------------------
+// Ambient Music (Phase 4)
+// ---------------------------------------------------------------------------
+
+let mutable private currentMusicOsc: obj option = None
+
+let startAmbientMusic (themeStr: string) =
+    match ctx with
+    | None -> ()
+    | Some c ->
+        // Stop existing
+        match currentMusicOsc with
+        | Some o -> 
+            try o?stop() |> ignore with _ -> ()
+        | None -> ()
+        
+        let o = c.createOscillator ()
+        let g = c.createGain ()
+        
+        match themeStr with
+        | "Volcanic" ->
+            o?``type`` <- "sawtooth"
+            o?frequency?value <- 65.41 // C2
+            g?gain?value <- 0.04
+        | "Winter" ->
+            o?``type`` <- "sine"
+            o?frequency?value <- 880.0
+            g?gain?value <- 0.01
+        | _ -> // Grassland / River / Default
+            o?``type`` <- "sine"
+            o?frequency?value <- 130.81 // C3
+            g?gain?value <- 0.02
+            
+        o?connect(g) |> ignore
+        g?connect(c.destination) |> ignore
+        o?start() |> ignore
+        
+        currentMusicOsc <- Some o
+
+let stopAmbientMusic () =
+    match currentMusicOsc with
+    | Some o -> 
+        try o?stop() |> ignore with _ -> ()
+        currentMusicOsc <- None
+    | None -> ()
+

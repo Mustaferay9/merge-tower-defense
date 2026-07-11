@@ -148,6 +148,29 @@ type Tower =
       /// non-negative; fresh and freshly merged towers start ready (0.0).
       Cooldown: float }
 
+// ---------------------------------------------------------------------------
+// Talents
+// ---------------------------------------------------------------------------
+
+type Talents =
+    { StartingGoldLevel: int
+      ArcherDamageLevel: int
+      CannonDamageLevel: int
+      SpellCooldownLevel: int }
+
+module Talents =
+    let empty =
+        { StartingGoldLevel = 0
+          ArcherDamageLevel = 0
+          CannonDamageLevel = 0
+          SpellCooldownLevel = 0 }
+    
+    let startingGold t =
+        110 + t.StartingGoldLevel * 20
+
+    let spellCooldownMult t =
+        1.0 - (float t.SpellCooldownLevel * 0.05)
+
 type TowerStats =
     { Damage: int
       /// Attack radius in cell units.
@@ -163,17 +186,23 @@ module Tower =
 
     /// Stats derive from type + level and are never stored, so they can
     /// never disagree with the tower they describe.
-    let stats (tower: Tower) =
+    let stats (tower: Tower) (talents: Talents) =
         let b = baseStats tower.Type
         let r = TowerLevel.rank tower.Level
 
+        let baseDamage =
+            match tower.Type with
+            | Archer -> b.Damage + (talents.ArcherDamageLevel * 2)
+            | Cannon -> b.Damage + (talents.CannonDamageLevel * 4)
+            | Frost -> b.Damage
+
         { b with
-            Damage = b.Damage * pown 2 (r - 1)
+            Damage = baseDamage * pown 2 (r - 1)
             Range = b.Range + 0.25 * float (r - 1) }
 
     /// Attack damage as a validated Damage value. Total by construction:
     /// base damages are strictly positive and doubling keeps them positive.
-    let attackDamage (tower: Tower) : Damage = Damage((stats tower).Damage)
+    let attackDamage (tower: Tower) (talents: Talents) : Damage = Damage((stats tower talents).Damage)
 
     /// Two towers merge iff they are distinct, same type and same level, and
     /// below the ceiling. Returns the level the merged tower would have.
@@ -225,23 +254,33 @@ module Coord =
 type CellState =
     | Empty
     | Occupied of Tower
+    | BlockedCell
 
 /// The board. Absence in the map IS the empty cell — there is no separate
 /// "empty" marker that could drift out of sync with the tower map.
 type Grid =
     private
         { Size: GridSize
+          BlockedCells: Set<Coord>
           Towers: Map<Coord, Tower> }
 
 module Grid =
-    let create size = { Size = size; Towers = Map.empty }
+    let create size blocked = { Size = size; BlockedCells = blocked; Towers = Map.empty }
 
     let size grid = grid.Size
 
     let cellAt coord grid =
+        if Set.contains coord grid.BlockedCells then
+            BlockedCell
+        else
+            match Map.tryFind coord grid.Towers with
+            | Some tower -> Occupied tower
+            | None -> Empty
+
+    let tryFindTower coord grid =
         match Map.tryFind coord grid.Towers with
-        | Some tower -> Occupied tower
-        | None -> Empty
+        | Some t -> Some t
+        | None -> None
 
     /// All coordinates of the board, row-major.
     let coords grid =
@@ -270,7 +309,8 @@ module Grid =
     /// silently overwriting (losing) a tower is unrepresentable.
     let tryPlace coord tower grid =
         match cellAt coord grid with
-        | Occupied _ -> None
+        | Occupied _ 
+        | BlockedCell -> None
         | Empty ->
             Some
                 { grid with
@@ -399,53 +439,71 @@ module Path =
 // ---------------------------------------------------------------------------
 
 type EnemyType =
-    | Grunt
-    | Runner
-    | Tank
-    | Boss
+    | Bandit
+    | Cavalry
+    | Brute
+    | Warlord
+    | Necromancer
+    | Dragon
+    | MegaBoss
 
 module EnemyType =
     /// Base hit points per type. Values must stay strictly positive: they
     /// feed the private Health constructor in Enemy.spawnWith.
     let baseHealth =
         function
-        | Grunt -> 20
-        | Runner -> 12
-        | Tank -> 60
-        | Boss -> 250
+        | Bandit -> 20
+        | Cavalry -> 12
+        | Brute -> 60
+        | Warlord -> 150
+        | Necromancer -> 250
+        | Dragon -> 600
+        | MegaBoss -> 1500
 
     /// Movement speed in cells per second.
     let speed =
         function
-        | Grunt -> 0.9
-        | Runner -> 1.8
-        | Tank -> 0.55
-        | Boss -> 0.45
+        | Bandit -> 0.9
+        | Cavalry -> 1.8
+        | Brute -> 0.55
+        | Warlord -> 0.7
+        | Necromancer -> 0.45
+        | Dragon -> 0.8
+        | MegaBoss -> 0.35
 
     /// Gold awarded when the enemy is killed.
     let bounty =
         function
-        | Grunt -> 4
-        | Runner -> 6
-        | Tank -> 12
-        | Boss -> 50
+        | Bandit -> 4
+        | Cavalry -> 6
+        | Brute -> 12
+        | Warlord -> 30
+        | Necromancer -> 50
+        | Dragon -> 100
+        | MegaBoss -> 250
 
     /// Lives lost when the enemy reaches the goal.
     let livesCost =
         function
-        | Grunt -> 1
-        | Runner -> 1
-        | Tank -> 2
-        | Boss -> 3
+        | Bandit -> 1
+        | Cavalry -> 1
+        | Brute -> 2
+        | Warlord -> 3
+        | Necromancer -> 3
+        | Dragon -> 5
+        | MegaBoss -> 10
 
 type Enemy =
     { Id: EnemyId
       Type: EnemyType
+      MaxHealth: Health
       Health: Health
       Progress: PathProgress
       /// Remaining seconds of Frost slow effect. When positive the enemy
       /// moves at half speed. Decremented each tick by State.stepMovement.
-      SlowUntil: float }
+      SlowUntil: float
+      /// Cooldown until the next minion spawn (if applicable).
+      SpawnCooldown: float }
 
 module Enemy =
     /// Spawns at the path start; health = type base × multiplier, kept ≥ 1
@@ -458,9 +516,11 @@ module Enemy =
 
         { Id = id
           Type = enemyType
+          MaxHealth = Health hp
           Health = Health hp
           Progress = PathProgress.start
-          SlowUntil = 0.0 },
+          SlowUntil = 0.0
+          SpawnCooldown = match enemyType with MegaBoss -> 6.0 | Necromancer -> 4.0 | _ -> 0.0 },
         gen'
 
     let spawn (gen: EnemyIdGen) (enemyType: EnemyType) : Enemy * EnemyIdGen = spawnWith gen enemyType 1.0
@@ -478,10 +538,152 @@ module Enemy =
 
         if p' >= 1.0 then ReachedGoal else Moved(PathProgress p')
 
-    /// Decrement the slow timer by the elapsed seconds.
-    let tickSlow (dtSeconds: float) (enemy: Enemy) : Enemy =
-        if enemy.SlowUntil <= 0.0 then enemy
-        else { enemy with SlowUntil = max 0.0 (enemy.SlowUntil - dtSeconds) }
+    /// Decrement the slow timer and spawn cooldown by the elapsed seconds.
+    let tickCooldowns (dtSeconds: float) (enemy: Enemy) : Enemy =
+        { enemy with 
+            SlowUntil = max 0.0 (enemy.SlowUntil - dtSeconds)
+            SpawnCooldown = max 0.0 (enemy.SpawnCooldown - dtSeconds) }
 
     /// Current position in cell units.
     let positionOn (path: Path) (enemy: Enemy) : float * float = Path.positionAt path enemy.Progress
+
+    /// Movement angle in radians based on current trajectory.
+    let angleOn (path: Path) (enemy: Enemy) : float =
+        let p = PathProgress.value enemy.Progress
+        let p2 = min 1.0 (p + 0.001)
+        let x1, y1 = Path.positionAt path enemy.Progress
+        let x2, y2 = Path.pointAtDistance path (p2 * Path.length path)
+        if x2 = x1 && y2 = y1 then 0.0
+        else System.Math.Atan2(y2 - y1, x2 - x1)
+
+// ---------------------------------------------------------------------------
+// Active Spells
+// ---------------------------------------------------------------------------
+
+type ActiveSpell =
+    | Fireball
+    | FrostNova
+
+module ActiveSpell =
+    let radius = function
+        | Fireball -> 1.5
+        | FrostNova -> 2.5
+    
+    let cost = function
+        | Fireball -> 30
+        | FrostNova -> 25
+
+// ---------------------------------------------------------------------------
+// Maps & Geography
+// ---------------------------------------------------------------------------
+
+type MapTheme =
+    | Plain
+    | River
+    | Volcanic
+    | Winter
+
+module MapTheme =
+    let path (theme: MapTheme) (size: GridSize) : Path =
+        let n = float (GridSize.value size)
+        match theme with
+        | Plain -> 
+            Path.tryCreate [ -0.9, 2.5; n + 0.9, 2.5 ] |> Option.get
+        | River -> 
+            Path.tryCreate [ -0.9, 3.5; 5.5, 3.5; 5.5, n + 0.9 ] |> Option.get
+        | Volcanic -> 
+            Path.tryCreate [ 1.5, -0.9; 1.5, n - 2.5; n + 0.9, n - 2.5 ] |> Option.get
+        | Winter -> 
+            Path.tryCreate [ n - 1.5, -0.9; n - 1.5, 3.5; -0.9, 3.5 ] |> Option.get
+
+    let blockedCells (theme: MapTheme) (size: GridSize) : Set<Coord> =
+        let n = GridSize.value size
+        match theme with
+        | Plain -> Set.empty
+        | River ->
+            [ for r in 0 .. n - 1 do
+                if r <> 3 && r <> 4 then
+                    yield Coord.tryCreate size r 4
+                    yield Coord.tryCreate size r 5
+              yield Coord.tryCreate size (n - 1) 4
+              yield Coord.tryCreate size (n - 1) 5 ]
+            |> List.choose id |> Set.ofList
+        | Volcanic ->
+            [ for c in 0 .. n - 1 do
+                if c <> 1 && c <> 2 then
+                    yield Coord.tryCreate size 1 c
+              yield Coord.tryCreate size 0 1
+              yield Coord.tryCreate size 0 2 ]
+            |> List.choose id |> Set.ofList
+        | Winter ->
+            [ Coord.tryCreate size 1 1
+              Coord.tryCreate size 1 2
+              Coord.tryCreate size 2 1
+              Coord.tryCreate size (n-2) (n-3)
+              Coord.tryCreate size (n-3) (n-2)
+              Coord.tryCreate size (n-2) (n-2) ]
+            |> List.choose id |> Set.ofList
+
+// ---------------------------------------------------------------------------
+// Campaign & Levels
+// ---------------------------------------------------------------------------
+
+type LevelId = int
+
+type LevelDef =
+    { Id: LevelId
+      Name: string
+      Description: string
+      Size: GridSize
+      Theme: MapTheme
+      AllowedTowers: Set<TowerType>
+      StartingGold: int
+      WaveCount: int }
+
+module Levels =
+    let all =
+        [ { Id = 1
+            Name = "Rookie Bootcamp"
+            Description = "Defend the pass with basic infantry."
+            Size = GridSize.tryCreate 5 |> Option.get
+            Theme = Plain
+            AllowedTowers = Set.ofList [ Archer ] // Basic
+            StartingGold = 0
+            WaveCount = 5 }
+          { Id = 2
+            Name = "The River Crossing"
+            Description = "Hold the bridge against heavier forces."
+            Size = GridSize.tryCreate 6 |> Option.get
+            Theme = River
+            AllowedTowers = Set.ofList [ Archer; Cannon ]
+            StartingGold = 150
+            WaveCount = 10 }
+          { Id = 3
+            Name = "Volcanic Keep"
+            Description = "Use Frost magic to slow the horde."
+            Size = GridSize.tryCreate 7 |> Option.get
+            Theme = Volcanic
+            AllowedTowers = Set.ofList [ Archer; Cannon; Frost ]
+            StartingGold = 200
+            WaveCount = 15 }
+          { Id = 4
+            Name = "Winter Siege"
+            Description = "Command all forces to defend the Citadel."
+            Size = GridSize.tryCreate 8 |> Option.get
+            Theme = Winter
+            AllowedTowers = Set.ofList [ Archer; Cannon; Frost ]
+            StartingGold = 300
+            WaveCount = 20 } ]
+    
+    let get id = all |> List.tryFind (fun l -> l.Id = id)
+
+type CampaignState =
+    { UnlockedLevels: Set<LevelId>
+      PersistentGold: int
+      Talents: Talents }
+
+module CampaignState =
+    let empty =
+        { UnlockedLevels = Set.singleton 1
+          PersistentGold = 0
+          Talents = Talents.empty }

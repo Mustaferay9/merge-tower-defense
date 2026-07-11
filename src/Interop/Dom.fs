@@ -12,3 +12,12 @@ let appendChild (parent: obj) (child: obj) : unit = jsNative
 
 [<Emit("globalThis")>]
 let globalThis: obj = jsNative
+
+[<Emit("localStorage.getItem($0)")>]
+let getItem (key: string) : string option = jsNative
+
+[<Emit("localStorage.setItem($0, $1)")>]
+let setItem (key: string) (value: string) : unit = jsNative
+
+[<Emit("$0.innerHTML = $1")>]
+let setInnerHTML (element: obj) (html: string) : unit = jsNative

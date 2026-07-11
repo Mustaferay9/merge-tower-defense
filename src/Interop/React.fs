@@ -32,8 +32,12 @@ let element (tag: string) (props: (string * obj) list) (children: ReactElement l
 
 let div props children = element "div" props children
 let span props children = element "span" props children
+let p props children = element "p" props children
 let button props children = element "button" props children
 let h1 props children = element "h1" props children
+let h3 props children = element "h3" props children
+let br props children = element "br" props children
+let img props children = element "img" props children
 
 /// A bare string as a React child.
 let str (text: string) : ReactElement = unbox text
