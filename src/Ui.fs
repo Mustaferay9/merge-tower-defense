@@ -136,7 +136,8 @@ type UiModel =
       /// Remaining screen shake intensity (decays per frame).
       ScreenShake: float
       /// Remaining red screen flash opacity (decays per frame).
-      RedFlash: float }
+      RedFlash: float
+      IsSettingsOpen: bool }
 
 type UiMsg =
     /// Forward a message to the core engine untouched.
@@ -158,6 +159,8 @@ type UiMsg =
     | OpenTalentTree
     | CloseTalentTree
     | UpgradeTalent of string
+    | ToggleSettings
+    | ChangeLanguage of Language
 
 let init (campaign: CampaignState) (level: LevelDef) (maxWave: int) : UiModel =
     let game = GameState.create level campaign.Talents
@@ -173,7 +176,8 @@ let init (campaign: CampaignState) (level: LevelDef) (maxWave: int) : UiModel =
       Shockwaves = []
       FloatingTexts = []
       ScreenShake = 0.0
-      RedFlash = 0.0 }
+      RedFlash = 0.0
+      IsSettingsOpen = false }
 
 // ---------------------------------------------------------------------------
 // HUD-facing helpers
@@ -447,6 +451,13 @@ let updateUi (layout: Layout) (msg: UiMsg) (model: UiModel) : UiModel =
     | OpenTalentTree ->
         let game = { model.Game with Status = TalentScreen }
         { model with Game = game }
+        
+    | ToggleSettings ->
+        { model with IsSettingsOpen = not model.IsSettingsOpen }
+        
+    | ChangeLanguage lang ->
+        let campaign = { model.Campaign with Language = lang }
+        { model with Campaign = campaign }
 
     | CloseTalentTree ->
         let game = { model.Game with Status = CampaignMenu }

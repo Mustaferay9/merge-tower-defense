@@ -35,6 +35,7 @@ let span props children = element "span" props children
 let p props children = element "p" props children
 let button props children = element "button" props children
 let h1 props children = element "h1" props children
+let h2 props children = element "h2" props children
 let h3 props children = element "h3" props children
 let br props children = element "br" props children
 let img props children = element "img" props children

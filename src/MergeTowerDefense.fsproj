@@ -8,6 +8,7 @@
   <ItemGroup>
     <!-- Pure core (no DOM/Pixi/IO) -->
     <Compile Include="Shared.fs" />
+    <Compile Include="I18n.fs" />
     <Compile Include="State.fs" />
     <Compile Include="Ui.fs" />
     <!-- Interop boundary -->

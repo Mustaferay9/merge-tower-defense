@@ -9,6 +9,7 @@ open MergeTowerDefense.Shared
 open MergeTowerDefense.State
 open MergeTowerDefense.Ui
 open MergeTowerDefense.Interop.React
+open MergeTowerDefense.I18n
 
 let private stat (id: string) (label: string) (value: string) =
     div
@@ -16,17 +17,17 @@ let private stat (id: string) (label: string) (value: string) =
         [ span [ "className", box "hud-stat-label" ] [ str label ]
           span [ "className", box "hud-stat-value"; "id", box id ] [ str value ] ]
 
-let private waveLabel (game: GameState) =
+let private waveLabel (lang: Language) (game: GameState) =
     match game.Status with
     | CampaignMenu | TalentScreen | Victory -> "-"
-    | Defeated waves -> sprintf "%d survived" waves
+    | Defeated waves -> sprintf "%d %s" waves (t lang "survived")
     | Playing _ ->
         match game.Wave.Phase with
-        | BetweenWaves seconds -> sprintf "%d — next in %.0fs" game.Wave.Number (ceil seconds)
+        | BetweenWaves seconds -> sprintf "%d — %s %.0fs" game.Wave.Number (t lang "next_in") (ceil seconds)
         | Spawning _
         | WaveActive -> string game.Wave.Number
 
-let private livesLabel (game: GameState) =
+let private livesLabel (lang: Language) (game: GameState) =
     match game.Status with
     | CampaignMenu | TalentScreen | Victory -> "-"
     | Playing lives -> string (Lives.value lives)
@@ -50,6 +51,7 @@ let private waveProgress (game: GameState) =
     | _ -> nothing
 
 let private buyButton (model: UiModel) (dispatch: UiMsg -> unit) (towerType: TowerType) =
+    let lang = model.Campaign.Language
     let name = string towerType
 
     button
@@ -57,9 +59,10 @@ let private buyButton (model: UiModel) (dispatch: UiMsg -> unit) (towerType: Tow
           "className", box (sprintf "hud-buy hud-buy-%s" (name.ToLowerInvariant()))
           "disabled", box (not (canBuy model))
           "onClick", box (fun (_: obj) -> dispatch (Buy towerType)) ]
-        [ str (sprintf "%s — %dg" name (nextTowerCost model.Game)) ]
+        [ str (sprintf "%s — %dg" (t lang "buy_tower") (nextTowerCost model.Game)) ]
 
 let private sellButton (model: UiModel) (dispatch: UiMsg -> unit) =
+    let lang = model.Campaign.Language
     let canSell =
         match model.Game.Status, model.Game.Interaction, model.Hover with
         | Playing _, Idle, Some coord ->
@@ -73,10 +76,10 @@ let private sellButton (model: UiModel) (dispatch: UiMsg -> unit) =
         match model.Hover with
         | Some coord ->
             match Grid.cellAt coord model.Game.Grid with
-            | Occupied tower -> sprintf "Sell — +%dg" (sellValue tower)
+            | Occupied tower -> sprintf "%s — +%dg" (t lang "sell") (sellValue tower)
             | Empty 
-            | BlockedCell -> "Sell"
-        | None -> "Sell"
+            | BlockedCell -> t lang "sell"
+        | None -> t lang "sell"
 
     button
         [ "id", box "sell"
@@ -116,7 +119,35 @@ let private spellButton (model: UiModel) (dispatch: UiMsg -> unit) (spell: Activ
           "onClick", box onClick ]
         [ str label ]
 
+let private settingsOverlay (model: UiModel) (dispatch: UiMsg -> unit) =
+    if not model.IsSettingsOpen then nothing
+    else
+        let lang = model.Campaign.Language
+        let langBtn l name =
+            button
+                [ "className", box (if lang = l then "hud-btn active" else "hud-btn")
+                  "onClick", box (fun (_: obj) -> dispatch (ChangeLanguage l)) ]
+                [ str name ]
+        
+        div [ "className", box "settings-overlay active" ]
+            [ div [ "className", box "settings-modal"; "dir", box (if isRtl lang then "rtl" else "ltr") ]
+                  [ h2 [] [ str (t lang "settings") ]
+                    div [ "className", box "settings-section" ]
+                        [ h3 [] [ str (t lang "language") ]
+                          div [ "className", box "language-buttons" ]
+                              [ langBtn EN "English"
+                                langBtn TR "Türkçe"
+                                langBtn DE "Deutsch"
+                                langBtn AR "العربية"
+                                langBtn RU "Русский"
+                                langBtn ZH "中文" ] ]
+                    button
+                        [ "className", box "hud-restart"
+                          "onClick", box (fun (_: obj) -> dispatch ToggleSettings) ]
+                        [ str (t lang "close") ] ] ]
+
 let view (model: UiModel) (dispatch: UiMsg -> unit) =
+    let lang = model.Campaign.Language
     let overlay =
         match model.Game.Status with
         | CampaignMenu ->
@@ -134,8 +165,8 @@ let view (model: UiModel) (dispatch: UiMsg -> unit) =
                                 "onClick", box (fun (_: obj) -> if isUnlocked then dispatch (SelectLevel level.Id)) ]
                               [ span [ "className", box "level-number" ] [ str (string level.Id) ] ]
                           div [ "className", box "level-info" ]
-                              [ h3 [] [ str level.Name ]
-                                p [] [ str level.Description ] ] ]
+                              [ h3 [] [ str (t lang (sprintf "level_%d_name" level.Id)) ]
+                                p [] [ str (t lang (sprintf "level_%d_desc" level.Id)) ] ] ]
                 )
 
             div
@@ -150,7 +181,11 @@ let view (model: UiModel) (dispatch: UiMsg -> unit) =
                   button
                       [ "className", box "hud-start"
                         "onClick", box (fun (_: obj) -> dispatch OpenTalentTree) ]
-                      [ str "Talent Tree" ] ]
+                      [ str (t lang "talents") ]
+                  button
+                      [ "className", box "hud-start"; "style", box {| marginTop = "10px" |}
+                        "onClick", box (fun (_: obj) -> dispatch ToggleSettings) ]
+                      [ str (t lang "settings") ] ]
         | TalentScreen ->
             let t = model.Game.Talents
             let costFor level = level + 1
@@ -190,20 +225,20 @@ let view (model: UiModel) (dispatch: UiMsg -> unit) =
         | Defeated waves ->
             div
                 [ "className", box "hud-gameover"; "id", box "hud-gameover" ]
-                [ span [] [ str (sprintf "Game Over — you survived %d wave(s)." waves) ]
+                [ span [] [ str (sprintf "%s — %d %s." (t lang "defeated") waves (t lang "survived")) ]
                   button
                       [ "id", box "restart"
                         "className", box "hud-restart"
                         "onClick", box (fun (_: obj) -> dispatch Restart) ]
-                      [ str "Restart" ] ]
+                      [ str (t lang "restart") ] ]
         | Victory ->
             div
                 [ "className", box "hud-gameover" ]
-                [ span [] [ str "Victory! Kingdom Secured." ]
+                [ span [] [ str (t lang "victory") ]
                   button
                       [ "className", box "hud-restart"
                         "onClick", box (fun (_: obj) -> dispatch Restart) ]
-                      [ str "Return to Map" ] ]
+                      [ str (t lang "continue") ] ]
         | Playing _ -> nothing
 
     div
@@ -212,8 +247,8 @@ let view (model: UiModel) (dispatch: UiMsg -> unit) =
           div
               [ "className", box "hud-stats" ]
               [ stat "hud-gold" "💰 Gold" (string (Gold.value model.Game.Gold))
-                stat "hud-wave" "🌊 Wave" (waveLabel model.Game)
-                stat "hud-lives" "❤️ Lives" (livesLabel model.Game)
+                stat "hud-wave" (sprintf "🌊 %s" (t lang "wave")) (waveLabel lang model.Game)
+                stat "hud-lives" (sprintf "❤️ %s" (t lang "lives")) (livesLabel lang model.Game)
                 stat "hud-enemies" "👾 Enemies" (string (List.length model.Game.Enemies)) ]
           waveProgress model.Game
           div
@@ -227,6 +262,7 @@ let view (model: UiModel) (dispatch: UiMsg -> unit) =
               [ spellButton model dispatch Fireball
                 spellButton model dispatch FrostNova ]
           overlay
+          settingsOverlay model dispatch
           div
               [ "className", box "hud-notice"; "id", box "hud-notice" ]
               [ match model.Notice with

@@ -677,13 +677,17 @@ module Levels =
     
     let get id = all |> List.tryFind (fun l -> l.Id = id)
 
+type Language = EN | TR | DE | AR | RU | ZH
+
 type CampaignState =
     { UnlockedLevels: Set<LevelId>
       PersistentGold: int
-      Talents: Talents }
+      Talents: Talents
+      Language: Language }
 
 module CampaignState =
     let empty =
         { UnlockedLevels = Set.singleton 1
           PersistentGold = 0
-          Talents = Talents.empty }
+          Talents = Talents.empty
+          Language = EN }

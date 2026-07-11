@@ -378,7 +378,46 @@
       from { opacity: 0; transform: translateY(8px); }
       to   { opacity: 1; transform: translateY(0); }
     }
-  </style>
+  
+    /* Settings Overlay */
+    .settings-overlay {
+        position: absolute;
+        top: 0; left: 0; right: 0; bottom: 0;
+        background: rgba(0, 0, 0, 0.85);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 1000;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.3s ease;
+    }
+    .settings-overlay.active {
+        opacity: 1;
+        pointer-events: auto;
+    }
+    .settings-modal {
+        background: rgba(30, 40, 60, 0.95);
+        padding: 30px;
+        border-radius: 12px;
+        border: 2px solid rgba(100, 150, 255, 0.4);
+        box-shadow: 0 0 30px rgba(0, 0, 0, 0.8);
+        width: 80%;
+        max-width: 400px;
+        text-align: center;
+        display: flex;
+        flex-direction: column;
+        gap: 20px;
+        color: #fff;
+    }
+    .settings-modal h2 { margin: 0; font-size: 1.5em; text-shadow: 0 2px 4px rgba(0,0,0,0.5); }
+    .settings-section h3 { margin: 0 0 10px 0; font-size: 1.1em; color: #aaa; }
+    .language-buttons {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+    }
+</style>
 </head>
 <body>
   <div id="app">
